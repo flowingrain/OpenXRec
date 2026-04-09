@@ -184,6 +184,9 @@ export default function OpenXRecHome() {
   const [kgRelations, setKgRelations] = useState<KGRelation[]>([]);
   // 展开的推荐项ID
   const [expandedRecId, setExpandedRecId] = useState<string | null>(null);
+  // 推荐反馈状态（用于按钮高亮与防重复点击）
+  const [feedbackByItem, setFeedbackByItem] = useState<Record<string, 'like' | 'dislike'>>({});
+  const [feedbackPending, setFeedbackPending] = useState<Record<string, boolean>>({});
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -407,10 +410,15 @@ export default function OpenXRecHome() {
     }
   };
 
-  // 发送反馈
+  // 发送反馈（专用 /api/recommendation/feedback，勿用 /api/chat-feedback：后者是分析对话上下文用的）
   const sendFeedback = async (itemId: string, feedbackType: 'like' | 'dislike') => {
+    if (!itemId) return;
+    const prev = feedbackByItem[itemId];
+    // 乐观更新：先让按钮有状态反馈
+    setFeedbackByItem((s) => ({ ...s, [itemId]: feedbackType }));
+    setFeedbackPending((s) => ({ ...s, [itemId]: true }));
     try {
-      await fetch('/api/chat-feedback', {
+      const res = await fetch('/api/recommendation/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -419,8 +427,28 @@ export default function OpenXRecHome() {
           feedbackType,
         }),
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.warn('[sendFeedback]', res.status, err);
+        // 回滚到之前状态
+        setFeedbackByItem((s) => {
+          const next = { ...s };
+          if (prev) next[itemId] = prev;
+          else delete next[itemId];
+          return next;
+        });
+      }
     } catch (e) {
       console.warn('Failed to send feedback:', e);
+      // 回滚到之前状态
+      setFeedbackByItem((s) => {
+        const next = { ...s };
+        if (prev) next[itemId] = prev;
+        else delete next[itemId];
+        return next;
+      });
+    } finally {
+      setFeedbackPending((s) => ({ ...s, [itemId]: false }));
     }
   };
 
@@ -443,10 +471,26 @@ export default function OpenXRecHome() {
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.data) {
+          const incomingEntities: KGEntity[] = data.data.entities || [];
+          const incomingRelations: KGRelation[] = data.data.relations || [];
+
+          // 先构建「名称 -> 稳定ID」映射：优先使用已有实体ID，避免关系引用临时ID导致悬挂
+          const nameToStableId = new Map<string, string>();
+          kgEntities.forEach((e) => nameToStableId.set(e.name, e.id));
+          incomingEntities.forEach((e) => {
+            if (!nameToStableId.has(e.name)) {
+              nameToStableId.set(e.name, e.id);
+            }
+          });
+
+          // 本轮抽取的临时ID -> 名称（用于关系端点重映射）
+          const tempIdToName = new Map<string, string>();
+          incomingEntities.forEach((e) => tempIdToName.set(e.id, e.name));
+
           // 合并新的实体和关系
           setKgEntities(prev => {
             const newEntities = [...prev];
-            for (const entity of data.data.entities || []) {
+            for (const entity of incomingEntities) {
               if (!newEntities.find(e => e.name === entity.name)) {
                 newEntities.push(entity);
               }
@@ -456,12 +500,31 @@ export default function OpenXRecHome() {
 
           setKgRelations(prev => {
             const newRelations = [...prev];
-            for (const relation of data.data.relations || []) {
+            for (const relation of incomingRelations) {
+              const sourceName = tempIdToName.get(relation.source_entity_id);
+              const targetName = tempIdToName.get(relation.target_entity_id);
+              const resolvedSourceId = sourceName
+                ? nameToStableId.get(sourceName) || relation.source_entity_id
+                : relation.source_entity_id;
+              const resolvedTargetId = targetName
+                ? nameToStableId.get(targetName) || relation.target_entity_id
+                : relation.target_entity_id;
+
+              // 若仍缺端点，跳过该关系，避免图布局异常
+              if (!resolvedSourceId || !resolvedTargetId) continue;
+
+              const normalizedRelation: KGRelation = {
+                ...relation,
+                source_entity_id: resolvedSourceId,
+                target_entity_id: resolvedTargetId,
+              };
+
               if (!newRelations.find(r => 
-                r.source_entity_id === relation.source_entity_id && 
-                r.target_entity_id === relation.target_entity_id
+                r.source_entity_id === normalizedRelation.source_entity_id && 
+                r.target_entity_id === normalizedRelation.target_entity_id &&
+                r.type === normalizedRelation.type
               )) {
-                newRelations.push(relation);
+                newRelations.push(normalizedRelation);
               }
             }
             return newRelations;
@@ -774,322 +837,7 @@ export default function OpenXRecHome() {
                                 </div>
                               )}
                               
-                              {/* 排序型推荐结果 */}
-                              {message.recommendationType === 'ranking' && message.recommendations && message.recommendations.length > 0 && (
-                                <div className="mt-3 space-y-2">
-                                  <div className="flex items-center gap-2 text-sm font-medium text-blue-700 mb-2">
-                                    <Target className="w-4 h-4" />
-                                    推荐排名
-                                  </div>
-                                  {message.recommendations.map((rec, index) => {
-                                    const rankingRec = rec as RankingItem;
-                                    const isTop = index === 0;
-                                    const recId = rec.id || `ranking-${index}`;
-                                    const isExpanded = expandedRecId === recId;
-                                    return (
-                                      <div key={rec.id}>
-                                        <div
-                                          className={cn(
-                                            "bg-white border rounded-lg p-3 text-left cursor-pointer transition-all",
-                                            isTop && "border-yellow-400 bg-yellow-50/30",
-                                            isExpanded && "border-blue-400"
-                                          )}
-                                          onClick={() => setExpandedRecId(isExpanded ? null : recId)}
-                                        >
-                                          <div className="flex items-start gap-3">
-                                            <div className={cn(
-                                              "w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shrink-0",
-                                              isTop ? "bg-yellow-400 text-yellow-900" : "bg-slate-100 text-slate-600"
-                                            )}>
-                                              {index + 1}
-                                            </div>
-                                            <div className="flex-1">
-                                              <div className="flex items-center gap-2">
-                                                <span className="font-medium text-sm">{String(rec.title || '')}</span>
-                                                <Badge variant="outline" className="text-xs">
-                                                  {rankingRec?.overallScore ? `${rankingRec.overallScore}分` : `${(rec.score * 100).toFixed(0)}%`}
-                                                </Badge>
-                                                <ChevronRight className={cn(
-                                                  "w-4 h-4 text-muted-foreground ml-auto transition-transform",
-                                                  isExpanded && "rotate-90"
-                                                )} />
-                                              </div>
-                                              <p className="text-xs text-muted-foreground mt-1">
-                                                {String(rec.description || '')}
-                                              </p>
-                                            
-                                              {/* 默认展开的内容：分项得分 */}
-                                              {!isExpanded && rankingRec?.scores && rankingRec.scores.length > 0 && (
-                                                <div className="mt-2 grid grid-cols-2 gap-1">
-                                                  {rankingRec.scores.slice(0, 3).map((score, i) => (
-                                                    <div key={i} className="text-xs flex items-center justify-between">
-                                                      <span className="text-muted-foreground">{score.name}:</span>
-                                                      <span className="text-slate-600">{score.score}</span>
-                                                    </div>
-                                                  ))}
-                                                </div>
-                                              )}
-                                            
-                                              {/* 优劣势（默认展开） */}
-                                              {!isExpanded && (
-                                                <div className="mt-2 flex gap-2">
-                                                  {rankingRec?.advantages && rankingRec.advantages.length > 0 && (
-                                                    <div className="flex-1">
-                                                      {rankingRec.advantages.slice(0, 2).map((adv, i) => (
-                                                        <span key={i} className="inline-flex items-center text-[10px] text-green-700 bg-green-50 px-1.5 py-0.5 rounded mr-1">
-                                                          + {adv}
-                                                        </span>
-                                                      ))}
-                                                    </div>
-                                                  )}
-                                                </div>
-                                              )}
-                                            </div>
-                                          </div>
-                                        </div>
-                                        
-                                        {/* 展开的解释内容 */}
-                                        {isExpanded && (
-                                          <div className="mt-1 p-3 bg-white border border-t-0 border-blue-200 rounded-b-lg animate-in slide-in-from-top-2 duration-200">
-                                            {/* 完整分项得分 */}
-                                            {rankingRec?.scores && rankingRec.scores.length > 0 && (
-                                              <div className="mb-3">
-                                                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1.5">
-                                                  <Activity className="w-3.5 h-3.5" />
-                                                  详细评分
-                                                </div>
-                                                <div className="space-y-1">
-                                                  {rankingRec.scores.map((score, i) => (
-                                                    <div key={i} className="flex items-center gap-2 text-xs">
-                                                      <div className="flex-1 flex items-center gap-2">
-                                                        <span className="text-muted-foreground">{String(score.name || '')}:</span>
-                                                        <span className="text-slate-700">{String(score.description || score.score || '')}</span>
-                                                      </div>
-                                                      <div className="flex items-center gap-1">
-                                                        <div className="w-12 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                                                          <div 
-                                                            className="h-full bg-blue-500 rounded-full"
-                                                            style={{ width: `${score.score}%` }}
-                                                          />
-                                                        </div>
-                                                        <span className="text-slate-600 w-8">{score.score}</span>
-                                                      </div>
-                                                    </div>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            )}
-                                            
-                                            {/* 优劣势详情 */}
-                                            <div className="mb-3 flex gap-4">
-                                              {rankingRec?.advantages && rankingRec.advantages.length > 0 && (
-                                                <div className="flex-1">
-                                                  <div className="text-xs font-medium text-green-700 mb-1">优势</div>
-                                                  {rankingRec.advantages.map((adv, i) => (
-                                                    <span key={i} className="inline-flex items-center text-xs text-green-700 bg-green-50 px-1.5 py-0.5 rounded mr-1 mb-1 block">
-                                                      + {adv}
-                                                    </span>
-                                                  ))}
-                                                </div>
-                                              )}
-                                              {rankingRec?.disadvantages && rankingRec.disadvantages.length > 0 && (
-                                                <div className="flex-1">
-                                                  <div className="text-xs font-medium text-red-700 mb-1">劣势</div>
-                                                  {rankingRec.disadvantages.map((dis, i) => (
-                                                    <span key={i} className="inline-flex items-center text-xs text-red-700 bg-red-50 px-1.5 py-0.5 rounded mr-1 mb-1 block">
-                                                      - {dis}
-                                                    </span>
-                                                  ))}
-                                                </div>
-                                              )}
-                                            </div>
-                                            
-                                            {/* 解释说明 */}
-                                            {rec.explanation && (
-                                              <div className="mb-3">
-                                                <div className="flex items-center gap-1.5 text-xs font-medium text-blue-700 mb-1">
-                                                  <Lightbulb className="w-3.5 h-3.5" />
-                                                  推荐理由
-                                                </div>
-                                                <p className="text-xs text-muted-foreground leading-relaxed">{String(rec.explanation || '')}</p>
-                                              </div>
-                                            )}
-                                            
-                                            {/* 匹配因素 */}
-                                            {rec.factors && rec.factors.length > 0 && (
-                                              <div className="mb-3">
-                                                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1.5">
-                                                  <Target className="w-3.5 h-3.5" />
-                                                  匹配因素
-                                                </div>
-                                                <div className="space-y-1">
-                                                  {rec.factors.map((factor, i) => (
-                                                    <div key={i} className="flex items-center gap-2 text-xs">
-                                                      <div className="flex-1 flex items-center gap-2">
-                                                        <span className="text-muted-foreground">{factor.name}:</span>
-                                                        <span className="text-slate-700">{String(factor.value ?? '')}</span>
-                                                      </div>
-                                                      <div className="flex items-center gap-1">
-                                                        <div className="w-10 h-1 bg-slate-100 rounded-full overflow-hidden">
-                                                          <div 
-                                                            className="h-full bg-blue-500 rounded-full"
-                                                            style={{ width: `${factor.importance * 100}%` }}
-                                                          />
-                                                        </div>
-                                                        <span className="text-muted-foreground w-8">{(factor.importance * 100).toFixed(0)}%</span>
-                                                      </div>
-                                                    </div>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            )}
-                                            
-                                            {/* 来源链接 */}
-                                            {rec.sourceUrl && (
-                                              <div className="flex items-center gap-2 pt-2 border-t">
-                                                <a 
-                                                  href={rec.sourceUrl}
-                                                  target="_blank"
-                                                  rel="noopener noreferrer"
-                                                  className="text-xs text-blue-600 hover:underline flex items-center gap-1"
-                                                  onClick={(e) => e.stopPropagation()}
-                                                >
-                                                  <ExternalLink className="w-3 h-3" />
-                                                  {rec.source || '查看详情'}
-                                                </a>
-                                              </div>
-                                            )}
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                              
-                              {/* 对比分析型结果（新） */}
-                              {message.recommendationType === 'comparison_analysis' && message.recommendations && message.recommendations.length > 0 && (
-                                <div className="mt-3 space-y-3">
-                                  {message.recommendations.map((rec) => (
-                                    <div
-                                      key={rec.id}
-                                      className="bg-white border rounded-lg p-4 text-left"
-                                    >
-                                      {/* 标题 */}
-                                      <div className="flex items-center gap-2 mb-3">
-                                        <span className="font-semibold text-base">{String(rec.title || '')}</span>
-                                        <Badge variant="secondary" className="text-xs">
-                                          对比分析
-                                        </Badge>
-                                      </div>
-                                      
-                                      {/* 使用 Markdown 渲染描述（优缺点列表） */}
-                                      <div className="text-sm prose prose-sm max-w-none">
-                                        <MarkdownRenderer content={String(rec.description || '')} />
-                                      </div>
-                                      
-                                      {/* 信息来源 */}
-                                      {rec.metadata?.sources && rec.metadata.sources.length > 0 && (
-                                        <div className="mt-3 pt-3 border-t">
-                                          <div className="text-xs text-muted-foreground mb-2">
-                                            📚 信息来源
-                                          </div>
-                                          <div className="flex flex-wrap gap-2">
-                                            {rec.metadata.sources.map((source, idx) => (
-                                              <Badge 
-                                                key={idx} 
-                                                variant="outline" 
-                                                className="text-xs cursor-pointer hover:bg-muted"
-                                              >
-                                                {source.title}
-                                              </Badge>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
-                                      
-                                      {/* 反馈按钮 */}
-                                      <div className="mt-3 flex gap-2">
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 text-xs"
-                                          onClick={() => sendFeedback(rec.id, 'like')}
-                                        >
-                                          <ThumbsUp className="w-3 h-3 mr-1" />
-                                          有帮助
-                                        </Button>
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 text-xs"
-                                          onClick={() => sendFeedback(rec.id, 'dislike')}
-                                        >
-                                          <ThumbsDown className="w-3 h-3 mr-1" />
-                                          不相关
-                                        </Button>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                              
-                              {/* 对比型推荐结果（默认） */}
-                              {(!message.recommendationType || message.recommendationType === 'comparison') && message.recommendations && message.recommendations.length > 0 && (
-                                <div className="mt-3 space-y-2">
-                                  {message.recommendations.map((rec) => (
-                                    <div
-                                      key={rec.id}
-                                      className="bg-white border rounded-lg p-3 text-left"
-                                    >
-                                      <div className="flex items-start justify-between gap-2">
-                                        <div className="flex-1">
-                                          <div className="flex items-center gap-2">
-                                            <span className="font-medium text-sm">{String(rec.title || '')}</span>
-                                            <Badge variant="outline" className="text-xs">
-                                              {(rec.score * 100).toFixed(0)}%匹配
-                                            </Badge>
-                                          </div>
-                                          <p className="text-xs text-muted-foreground mt-1">
-                                            {String(rec.description || '')}
-                                          </p>
-                                        </div>
-                                      </div>
-                                      
-                                      {/* 解释 */}
-                                      <div className="mt-2 p-2 bg-blue-50 rounded text-xs">
-                                        <div className="flex items-center gap-1 text-blue-700 font-medium mb-1">
-                                          <Info className="w-3 h-3" />
-                                          推荐理由
-                                        </div>
-                                        <p className="text-blue-600">{String(rec.explanation || '')}</p>
-                                      </div>
-                                      
-                                      {/* 反馈按钮 */}
-                                      <div className="mt-2 flex gap-2">
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 text-xs"
-                                          onClick={() => sendFeedback(rec.id, 'like')}
-                                        >
-                                          <ThumbsUp className="w-3 h-3 mr-1" />
-                                          有帮助
-                                        </Button>
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 text-xs"
-                                          onClick={() => sendFeedback(rec.id, 'dislike')}
-                                        >
-                                          <ThumbsDown className="w-3 h-3 mr-1" />
-                                          不相关
-                                        </Button>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
+                              {/* 消息气泡内不再重复渲染推荐列表，统一在下方“推荐结果”区域展示 */}
                             </div>
                             {message.role === 'user' && (
                               <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center flex-shrink-0">
@@ -1232,28 +980,48 @@ export default function OpenXRecHome() {
                                             </a>
                                           )}
                                           <div className="flex items-center gap-1 ml-auto">
+                                            {(() => {
+                                              const itemId = rec.id || String(index);
+                                              const liked = feedbackByItem[itemId] === 'like';
+                                              const disliked = feedbackByItem[itemId] === 'dislike';
+                                              const pending = !!feedbackPending[itemId];
+                                              return (
+                                                <>
                                             <Button
-                                              variant="ghost"
+                                              variant={liked ? 'secondary' : 'ghost'}
                                               size="sm"
-                                              className="h-8 px-2 text-xs hover:bg-green-50 hover:text-green-700 gap-1"
+                                              className={cn(
+                                                'h-8 px-2 text-xs hover:bg-green-50 hover:text-green-700 gap-1',
+                                                liked && 'bg-green-100 text-green-700'
+                                              )}
                                               onClick={(e) => {
                                                 e.stopPropagation();
+                                                sendFeedback(itemId, 'like');
                                               }}
+                                              disabled={pending}
                                             >
                                               <ThumbsUp className="w-3.5 h-3.5" />
                                               有帮助
                                             </Button>
                                             <Button
-                                              variant="ghost"
+                                              variant={disliked ? 'secondary' : 'ghost'}
                                               size="sm"
-                                              className="h-8 px-2 text-xs hover:bg-red-50 hover:text-red-700 gap-1"
+                                              className={cn(
+                                                'h-8 px-2 text-xs hover:bg-red-50 hover:text-red-700 gap-1',
+                                                disliked && 'bg-red-100 text-red-700'
+                                              )}
                                               onClick={(e) => {
                                                 e.stopPropagation();
+                                                sendFeedback(itemId, 'dislike');
                                               }}
+                                              disabled={pending}
                                             >
                                               <ThumbsDown className="w-3.5 h-3.5" />
                                               不相关
                                             </Button>
+                                                </>
+                                              );
+                                            })()}
                                           </div>
                                         </div>
                                       </CardContent>
@@ -1265,7 +1033,7 @@ export default function OpenXRecHome() {
                           </div>
                         </div>
                       );
-                    })}
+                    })()}
 
                     {/* 上传文件预览 */}
                     {uploadedFiles.length > 0 && (

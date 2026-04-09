@@ -14,7 +14,13 @@ import {
   intentAnalyzerNode,
   explanationGeneratorNode,
 } from './agents-nodes';
-import type { ExplanationFactor, RecommendationItem, RecommendationContext } from './types';
+import type {
+  ExplanationFactor,
+  RecommendationItem,
+  RecommendationContext,
+  UserProfile,
+} from './types';
+import { getChatModelId } from '@/lib/llm/chat-model';
 import {
   getTemplateSelector,
   TemplateRenderService,
@@ -71,6 +77,8 @@ export interface AgentRecommendationItem {
     reason: string;
     factors: ExplanationFactor[];
     weight: number;
+    /** 相对同批其他选项的差异（多推荐对比时使用） */
+    differentiator?: string;
   }>;
   source: string;
   sourceUrl?: string;  // 信息源链接
@@ -116,6 +124,10 @@ export class AgentRecommendationService {
       webContext?: string;
       sources?: string[];
       recommendationType?: { type: string; suggestedOutput: string };
+      /** 服务端或客户端传入的用户画像（与查询合并用于解释） */
+      userProfile?: Partial<UserProfile> | null;
+      /** 会话级补充：设备、地域、上一轮追问答案等 */
+      sessionHints?: string;
     }
   ): Promise<AgentRecommendationResult> {
     const startTime = Date.now();
@@ -205,7 +217,11 @@ export class AgentRecommendationService {
       const itemsWithExplanations = await this.runExplanationGenerator(
         rankedItems,
         query,
-        context,
+        {
+          ...context,
+          userProfile: context.userProfile ?? undefined,
+          sessionHints: context.sessionHints,
+        },
         intentResult
       );
       agentsUsed.push('explanation_generator');
@@ -817,10 +833,203 @@ ${i + 1}. [${item.id}] ${item.title}
     })).sort((a, b) => b.score - a.score);
   }
 
+  /** 合并显式画像、会话与查询推断，供推荐理由使用 */
+  private async buildUserPerspectiveNarrative(
+    query: string,
+    context: {
+      knowledgeContext?: string;
+      webContext?: string;
+      userProfile?: Partial<UserProfile> | null;
+      sessionHints?: string;
+    }
+  ): Promise<string> {
+    const parts: string[] = [];
+    const p = context.userProfile;
+    if (p?.interests?.length) {
+      parts.push(`兴趣与关注：${p.interests.join('、')}`);
+    }
+    if (p?.preferences && typeof p.preferences === 'object') {
+      const pref = p.preferences as Record<string, unknown>;
+      const seg = pref.segment ?? pref.role ?? pref['用户类型'];
+      if (typeof seg === 'string' && seg.trim()) {
+        parts.push(`画像区分 / 角色：${seg.trim()}`);
+      }
+      if (Array.isArray(pref.goals) && pref.goals.length) {
+        parts.push(`目标：${(pref.goals as string[]).join('、')}`);
+      }
+    }
+    if (p?.demographics?.occupation) {
+      parts.push(`职业/身份：${p.demographics.occupation}`);
+    }
+    if (p?.demographics?.location) {
+      parts.push(`地域：${p.demographics.location}`);
+    }
+    if (context.sessionHints?.trim()) {
+      parts.push(`会话补充：${context.sessionHints.trim().slice(0, 500)}`);
+    }
+    if (parts.length === 0) {
+      return this.inferPersonaFromQuery(query);
+    }
+    return ['【用户画像与情境】', ...parts].join('\n');
+  }
+
+  /** 无长期画像时从本次查询推断诉求（短文本） */
+  private async inferPersonaFromQuery(query: string): Promise<string> {
+    const prompt = `用户未提供显式画像。请只根据下面**当前查询**，用第二人称「您」概括：主要目标、约束或顾虑、经验层次（若可辨）。80字内，不要编造事实。
+
+查询：
+${query}
+
+只输出一段中文。`;
+
+    try {
+      const res = await this.llmClient.invoke(
+        [
+          { role: 'system', content: '你是用户研究助手：合理推断、不编造。' },
+          { role: 'user', content: prompt },
+        ],
+        { model: getChatModelId(), temperature: 0.2 }
+      );
+      const t = (res.content || '').trim();
+      if (t) {
+        return `【从本次提问推断的您的情况】\n${t}`;
+      }
+    } catch (e) {
+      console.warn('[inferPersonaFromQuery]', e);
+    }
+    return '【未提供长期画像】请仅根据本次查询理解用户需求。';
+  }
+
+  /**
+   * 多推荐一次生成：用户视角 + 条目间对比
+   */
+  private async generateContrastiveExplanations(
+    items: Array<{
+      id: string;
+      title: string;
+      description: string;
+      source: string;
+      features: Record<string, any>;
+      score: number;
+      confidence: number;
+      matchReasons: string[];
+    }>,
+    query: string,
+    context: {
+      knowledgeContext?: string;
+      webContext?: string;
+      userProfile?: Partial<UserProfile> | null;
+      sessionHints?: string;
+    },
+    intentResult: any,
+    userPerspective: string
+  ): Promise<AgentRecommendationItem[] | null> {
+    const brief = items.map((it, i) => ({
+      rank: i + 1,
+      id: it.id,
+      title: it.title,
+      description: (it.description || '').slice(0, 360),
+      scorePct: Math.round(it.score * 100),
+      matchReasons: (it.matchReasons || []).slice(0, 5),
+      source: (it.source || '').slice(0, 80),
+    }));
+
+    const prompt = `你是可解释推荐专家。请站在**用户（用「您」称呼）**的立场，说明每一条推荐与**其诉求/约束**的匹配关系，并写清**与同批其他选项相比**的定位差异。
+
+## 用户查询
+${query}
+
+## 用户画像与情境（含显式画像与/或从查询推断；请区分事实与推断）
+${userPerspective}
+
+## 意图
+- 场景：${intentResult.scenarioType}
+- 推荐形态：${intentResult.recommendationType}
+- 实体：${intentResult.entities?.map((e: any) => `${e.name}(${e.type})`).join('、') || '无'}
+- 意图摘要：${intentResult.userIntent || '—'}
+
+## 待解释列表（已排序，rank 越小越靠前）
+${JSON.stringify(brief, null, 2)}
+
+## 可用背景（勿编造不存在的链接或机构）
+${context.knowledgeContext ? `知识片段：${context.knowledgeContext.slice(0, 550)}` : ''}
+${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : ''}
+
+## 任务
+对每一条输出：
+- reason：55～95 字；必须说明**本条如何回应查询中的具体诉求**（需求匹配），可点到来源类型（知识库/检索/模型分析），勿空洞套话。
+- differentiator：45 字内；说明**若要在本批结果里选**，本条更适合哪类用户或场景（与其他条目的差异）。
+- factors：2～4 条，category 仅 user|item|context|knowledge
+
+**严格 JSON**（items 数组长度必须等于 ${brief.length}，且 itemId 与列表 id 一致）：
+{
+  "items": [
+    {
+      "itemId": "id",
+      "type": "feature_similarity|behavioral|causal|knowledge_graph|collaborative|rule_based",
+      "reason": "...",
+      "differentiator": "...",
+      "factors": [{"name":"...","value":"...","importance":0.8,"category":"user"}]
+    }
+  ]
+}`;
+
+    const res = await this.llmClient.invoke(
+      [
+        {
+          role: 'system',
+          content:
+            '你只输出合法 JSON。推荐理由必须从用户视角写清「需求—匹配」关系，并体现多选项对比。',
+        },
+        { role: 'user', content: prompt },
+      ],
+      { model: getChatModelId(), temperature: 0.42 }
+    );
+
+    const jsonMatch = res.content?.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const rows = parsed.items;
+    if (!Array.isArray(rows) || rows.length !== items.length) {
+      return null;
+    }
+
+    return items.map((item, idx) => {
+      const row =
+        rows.find((r: { itemId?: string }) => r.itemId === item.id) || rows[idx];
+      const reason =
+        typeof row?.reason === 'string' && row.reason.trim()
+          ? row.reason.trim()
+          : this.generateFallbackReason(item, intentResult, context);
+      return {
+        id: item.id,
+        title: item.title,
+        description: item.description,
+        score: item.score,
+        confidence: item.confidence,
+        explanations: [
+          {
+            type: row?.type || 'feature_similarity',
+            reason,
+            differentiator:
+              typeof row?.differentiator === 'string' ? row.differentiator.trim() : undefined,
+            factors: Array.isArray(row?.factors) ? row.factors : [],
+            weight: 1.0,
+          },
+        ],
+        source: item.source,
+        metadata: {
+          features: item.features,
+          matchReasons: item.matchReasons,
+        },
+      };
+    });
+  }
+
   /**
    * 解释生成智能体（核心！）
-   * 
-   * 为每个推荐生成有依据的解释
+   *
+   * 多推荐时优先一次生成对比式理由；单条或批量失败时回退逐条生成。
    */
   private async runExplanationGenerator(
     items: Array<{
@@ -834,10 +1043,35 @@ ${i + 1}. [${item.id}] ${item.title}
       matchReasons: string[];
     }>,
     query: string,
-    context: { knowledgeContext?: string; webContext?: string; sources?: string[] },
+    context: {
+      knowledgeContext?: string;
+      webContext?: string;
+      sources?: string[];
+      userProfile?: Partial<UserProfile> | null;
+      sessionHints?: string;
+    },
     intentResult: any
   ): Promise<AgentRecommendationItem[]> {
     console.log('[ExplanationGenerator] Generating explanations for', items.length, 'items');
+
+    const userPerspective = await this.buildUserPerspectiveNarrative(query, context);
+
+    if (items.length >= 2) {
+      try {
+        const contrast = await this.generateContrastiveExplanations(
+          items,
+          query,
+          context,
+          intentResult,
+          userPerspective
+        );
+        if (contrast) {
+          return contrast;
+        }
+      } catch (e) {
+        console.warn('[ExplanationGenerator] contrastive batch failed, fallback per-item', e);
+      }
+    }
 
     const explanations = await Promise.all(
       items.map(async (item) => {
@@ -845,9 +1079,10 @@ ${i + 1}. [${item.id}] ${item.title}
           item,
           query,
           context,
-          intentResult
+          intentResult,
+          userPerspective
         );
-        
+
         return {
           id: item.id,
           title: item.title,
@@ -868,7 +1103,7 @@ ${i + 1}. [${item.id}] ${item.title}
   }
 
   /**
-   * 生成单个推荐的解释
+   * 生成单个推荐的解释（单条路径：仍带用户视角与需求匹配）
    */
   private async generateSingleExplanation(
     item: {
@@ -883,17 +1118,22 @@ ${i + 1}. [${item.id}] ${item.title}
     },
     query: string,
     context: { knowledgeContext?: string; webContext?: string; sources?: string[] },
-    intentResult: any
+    intentResult: any,
+    userPerspective: string
   ): Promise<{
     type: string;
     reason: string;
     factors: ExplanationFactor[];
     weight: number;
+    differentiator?: string;
   }> {
-    const prompt = `你是OpenXRec的解释生成智能体。为以下推荐生成有依据、可解释的推荐理由。
+    const prompt = `你是 OpenXRec 的解释生成智能体。请从**用户视角**写推荐理由：说明「用户的诉求/约束」与「本条内容」之间的**匹配关系**，避免泛泛的「很好、全面」。
 
 ## 用户查询
 ${query}
+
+## 用户画像与情境
+${userPerspective}
 
 ## 用户意图分析
 - 场景类型：${intentResult.scenarioType}
@@ -901,59 +1141,65 @@ ${query}
 - 识别实体：${intentResult.entities?.map((e: any) => `${e.name}(${e.type})`).join('、') || '无'}
 - 用户意图：${intentResult.userIntent}
 
-## 推荐项目
+## 推荐项目（本条）
 - 标题：${item.title}
 - 描述：${item.description}
-- 评分：${(item.score * 100).toFixed(0)}%
+- 匹配度：${(item.score * 100).toFixed(0)}%
 - 信息来源：${item.source}
 - 匹配原因：${item.matchReasons?.join('、') || '综合匹配'}
 
 ## 信息来源
-${context.knowledgeContext ? `知识库：${context.knowledgeContext.substring(0, 300)}...` : '无知识库信息'}
-${context.webContext ? `搜索结果：${context.webContext.substring(0, 300)}...` : '无搜索结果'}
+${context.knowledgeContext ? `知识库：${context.knowledgeContext.substring(0, 320)}` : '无知识库信息'}
+${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` : ''}
 
 ## 任务
-生成一个简洁、有说服力、基于事实的推荐理由。
-
-**要求**：
-1. 推荐理由要具体，说明为什么这个推荐适合用户
-2. 引用具体的信息来源（如果有）
-3. 突出这个推荐的核心优势
-4. 控制在50-80字
+用第二人称「您」写推荐理由（50～90 字）：点出**具体需求点**如何被满足；若有检索/知识库依据可一句带过。若只有单条推荐，differentiator 填「本批唯一推荐」或留空字符串。
 
 **输出格式**（JSON）：
 {
   "type": "feature_similarity|behavioral|causal|knowledge_graph|collaborative|rule_based",
-  "reason": "推荐理由（50-80字，具体、有说服力）",
+  "reason": "…",
+  "differentiator": "与其他选项相比的差异；仅一条时可空字符串",
   "factors": [
     {"name": "因素名称", "value": "因素值", "importance": 0.8, "category": "user|item|context|knowledge"}
   ]
 }`;
 
     try {
-      const response = await this.llmClient.invoke([
-        { role: 'system', content: '你是推荐解释生成专家，擅长生成简洁、有说服力的推荐理由。返回JSON格式。' },
-        { role: 'user', content: prompt }
-      ], {
-        model: 'doubao-seed-2-0-mini-260215',
-        temperature: 0.5,
-      });
+      const response = await this.llmClient.invoke(
+        [
+          {
+            role: 'system',
+            content:
+              '你是推荐解释专家：用户视角、需求匹配、可核验；只输出合法 JSON。',
+          },
+          { role: 'user', content: prompt },
+        ],
+        {
+          model: getChatModelId(),
+          temperature: 0.45,
+        }
+      );
 
       const jsonMatch = response.content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
+        const diff =
+          typeof parsed.differentiator === 'string' && parsed.differentiator.trim()
+            ? parsed.differentiator.trim()
+            : undefined;
         return {
           type: parsed.type || 'feature_similarity',
           reason: parsed.reason || '基于综合分析推荐',
           factors: parsed.factors || [],
           weight: 1.0,
+          differentiator: diff,
         };
       }
     } catch (e) {
       console.error('[ExplanationGenerator] Parse error for item', item.id, e);
     }
 
-    // 降级：基于现有信息生成简单理由
     const fallbackReason = this.generateFallbackReason(item, intentResult, context);
     return {
       type: 'feature_similarity',

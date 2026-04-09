@@ -337,33 +337,69 @@ export async function userProfilerNode(
       behaviorHistory: []
     };
 
-    // 使用 LLM 分析用户历史行为，提取兴趣和偏好
-    if (state.context.session?.previousItems && state.context.session.previousItems.length > 0) {
+    const q = state.context.query || '';
+    const hasHistory =
+      state.context.session?.previousItems && state.context.session.previousItems.length > 0;
+
+    if (hasHistory) {
       const prompt = `分析用户的行为历史，提取用户的兴趣和偏好。
 
 历史行为：
-${state.context.session.previousItems.map((itemId, idx) => `${idx + 1}. ${itemId}`).join('\n')}
+${state.context.session!.previousItems!.map((itemId, idx) => `${idx + 1}. ${itemId}`).join('\n')}
 
 请以JSON格式返回：
 {
   "interests": ["兴趣1", "兴趣2", ...],
-  "preferences": {"category": "value", ...}
+  "preferences": {"category": "value", "segment": "入门爱好者|进阶用户|专业从业者 等画像区分" }
 }`;
 
-      const response = await llmClient.invoke([
-        { role: 'system', content: '你是一个用户画像分析专家。' },
-        { role: 'user', content: prompt }
-      ], {
-        model: 'doubao-seed-2-0-mini-260215',
-        temperature: 0.3,
-      });
+      const response = await llmClient.invoke(
+        [
+          { role: 'system', content: '你是一个用户画像分析专家。' },
+          { role: 'user', content: prompt },
+        ],
+        {
+          model: 'doubao-seed-2-0-mini-260215',
+          temperature: 0.3,
+        }
+      );
 
       try {
-        const analysis = JSON.parse(response.content);
+        const analysis = JSON.parse(response.content || '{}');
         userProfile.interests = analysis.interests || [];
         userProfile.preferences = analysis.preferences || {};
       } catch (e) {
         console.error('[userProfiler] Failed to parse LLM response:', e);
+      }
+    } else if (q.trim()) {
+      const prompt = `无历史行为记录。请仅根据用户**当前查询**推断其目标、关注点、经验层次或约束（合理推断，不编造事实）。
+
+用户查询：
+${q}
+
+请以JSON格式返回：
+{
+  "interests": ["从查询提炼的兴趣或主题", ...],
+  "preferences": { "segment": "画像区分（如入门/进阶/专业）", "inferredGoals": "一句话目标" }
+}`;
+
+      const response = await llmClient.invoke(
+        [
+          { role: 'system', content: '你是用户画像分析专家，只做从查询可合理推出的推断。' },
+          { role: 'user', content: prompt },
+        ],
+        {
+          model: 'doubao-seed-2-0-mini-260215',
+          temperature: 0.25,
+        }
+      );
+
+      try {
+        const analysis = JSON.parse(response.content || '{}');
+        userProfile.interests = analysis.interests || [];
+        userProfile.preferences = analysis.preferences || {};
+      } catch (e) {
+        console.error('[userProfiler] Failed to parse query-only profile:', e);
       }
     }
 
@@ -697,12 +733,19 @@ export async function explanationGeneratorNode(
 
       if (!item) continue;
 
-      // 使用 LLM 生成自然语言解释
-      const prompt = `为以下推荐生成解释：
+      const interestLine =
+        state.userProfile.interests?.length > 0
+          ? state.userProfile.interests.join('、')
+          : '（未显式标注，请结合查询理解）';
+      const prefLine = JSON.stringify(state.userProfile.preferences || {});
+
+      const prompt = `为以下推荐生成解释。请站在**用户视角**，说明「用户诉求/约束」与「本条内容」的**匹配关系**（勿泛泛而谈）。
+
+用户查询：${state.context.query || '—'}
 
 用户画像：
-兴趣：${state.userProfile.interests.join('、')}
-偏好：${JSON.stringify(state.userProfile.preferences)}
+兴趣：${interestLine}
+偏好：${prefLine}
 
 推荐物品：
 标题：${item.title}
@@ -719,21 +762,35 @@ export async function explanationGeneratorNode(
       "category": "user/item/context/knowledge"
     }
   ],
-  "reason": "自然语言解释（1-2句话）"
+  "reason": "自然语言解释（1-3句话，用「您」称呼，写清需求匹配点）"
 }`;
 
       const response = await chatViaInvoke(
         llmClient,
         [
-          { role: 'system', content: '你是一个推荐解释生成专家，擅长用简洁明了的语言解释推荐理由。' },
+          {
+            role: 'system',
+            content:
+              '你是推荐解释专家：从用户视角说明需求与条目的匹配关系，语言简洁。',
+          },
           { role: 'user', content: prompt },
         ],
         { model: 'doubao-seed-2-0-mini-260215', temperature: 0.3 }
       );
 
       try {
-        const explanation = JSON.parse(response);
-        explanations.set(item.id, explanation.factors || []);
+        const jsonMatch = response.match(/\{[\s\S]*\}/);
+        const explanation = JSON.parse(jsonMatch ? jsonMatch[0] : response);
+        const factors = [...(explanation.factors || [])];
+        if (typeof explanation.reason === 'string' && explanation.reason.trim()) {
+          factors.unshift({
+            name: '推荐理由',
+            value: explanation.reason.trim(),
+            importance: 1,
+            category: 'context',
+          });
+        }
+        explanations.set(item.id, factors);
       } catch (e) {
         console.error(`[explanationGenerator] Failed to parse explanation for item ${item.id}:`, e);
         explanations.set(item.id, [{

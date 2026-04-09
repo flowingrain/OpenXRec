@@ -47,7 +47,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { EvolutionHistoryPanel } from '@/components/evolution/EvolutionHistoryPanel';
-import type { KGEntity, KGRelation, EntityType, RelationType, ENTITY_TYPE_CONFIG, RELATION_TYPE_CONFIG } from '@/lib/knowledge-graph/types';
+import type { KGEntity, KGRelation, EntityType, RelationType } from '@/lib/knowledge-graph/types';
+import { ENTITY_ORDER, REL_ORDER } from '@/lib/knowledge-graph/kg-type-normalize';
 
 // 图标映射
 const IconMap: Record<string, React.FC<any>> = {
@@ -100,13 +101,53 @@ const RELATION_CONFIG: Record<RelationType, { color: string; label: string }> = 
   '其他': { color: '#9ca3af', label: '其他' }
 };
 
+function getEntityRawLabel(entity: KGEntity): string {
+  const raw = entity.properties?.typeLabelRaw;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : entity.type;
+}
+
+function getRelationRawLabel(relation: KGRelation): string {
+  const raw = relation.properties?.relationLabelRaw;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : relation.type;
+}
+
+/** 根据动态类型标签稳定生成颜色，确保不同类型自动区分 */
+function colorFromLabel(label: string, mode: 'entity' | 'relation'): string {
+  const s = (label || '').trim() || (mode === 'entity' ? '实体' : '关系');
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) {
+    hash = (hash * 31 + s.charCodeAt(i)) | 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  const sat = mode === 'entity' ? 68 : 62;
+  const light = mode === 'entity' ? 46 : 40;
+  return `hsl(${hue} ${sat}% ${light}%)`;
+}
+
+function markerIdFromRelationLabel(label: string): string {
+  const token = label.trim().replace(/[^\w\u4e00-\u9fa5-]/g, '_').slice(0, 24) || 'relation';
+  return `arrow-${token}`;
+}
+
+function isLikelyPersistedId(id: string): boolean {
+  if (!id) return false;
+  // 抽取接口返回的临时ID通常是 entity_/relation_ 前缀；数据库主键通常不是该前缀。
+  if (id.startsWith('entity_') || id.startsWith('relation_')) return false;
+  return true;
+}
+
 // 自定义实体节点
 function EntityNode({ data, selected }: NodeProps) {
-  const config = ENTITY_CONFIG[data.type as EntityType] || ENTITY_CONFIG['其他'];
+  const config = ENTITY_CONFIG[data.type as EntityType] || ENTITY_CONFIG['行业'];
+  const rawTypeLabel =
+    typeof data?.properties?.typeLabelRaw === 'string' && data.properties.typeLabelRaw.trim()
+      ? data.properties.typeLabelRaw.trim()
+      : data.type;
+  const dynamicColor = colorFromLabel(rawTypeLabel, 'entity');
   const Icon = IconMap[config.icon] || Circle;
   
   // 已验证用实线边框，待验证用虚线边框 + 更淡的颜色
-  const borderColor = data.verified ? config.color : `${config.color}80`;
+  const borderColor = data.verified ? dynamicColor : `${dynamicColor}80`;
   const borderStyle = data.verified ? 'solid' : 'dashed';
   const borderWidth = data.verified ? 2 : 2;
   const opacity = data.verified ? 1 : 0.7;
@@ -119,8 +160,8 @@ function EntityNode({ data, selected }: NodeProps) {
       `}
       style={{
         backgroundColor: data.verified 
-          ? `${config.color}15` 
-          : `${config.color}08`,
+          ? `${dynamicColor}15` 
+          : `${dynamicColor}08`,
         borderStyle,
         borderWidth,
         borderColor,
@@ -135,7 +176,7 @@ function EntityNode({ data, selected }: NodeProps) {
         <div 
           className="w-6 h-6 rounded-full flex items-center justify-center"
           style={{ 
-            backgroundColor: data.verified ? config.color : `${config.color}80`,
+            backgroundColor: data.verified ? dynamicColor : `${dynamicColor}80`,
             borderStyle: data.verified ? 'solid' : 'dashed',
             borderWidth: 1,
           }}
@@ -147,7 +188,9 @@ function EntityNode({ data, selected }: NodeProps) {
             {data.name}
           </div>
           <div className="text-[10px] text-gray-500 flex items-center gap-1">
-            <span>{data.type}</span>
+            <span title={(data.properties as { typeLabelRaw?: string } | undefined)?.typeLabelRaw}>
+              {String(rawTypeLabel).slice(0, 12)}
+            </span>
             {data.verified ? (
               <Check className="w-2.5 h-2.5 text-green-500" />
             ) : (
@@ -164,7 +207,12 @@ function EntityNode({ data, selected }: NodeProps) {
 
 // 自定义关系边
 function RelationEdge({ id, sourceX, sourceY, targetX, targetY, data, selected }: any) {
-  const config = RELATION_CONFIG[data.type as RelationType] || RELATION_CONFIG['其他'];
+  const config = RELATION_CONFIG[data.type as RelationType] || RELATION_CONFIG['关联'];
+  const rawLabel =
+    typeof data?.properties?.relationLabelRaw === 'string' && data.properties.relationLabelRaw.trim()
+      ? data.properties.relationLabelRaw.trim()
+      : config.label;
+  const dynamicColor = colorFromLabel(rawLabel, 'relation');
   
   const edgePath = `M ${sourceX} ${sourceY} L ${targetX} ${targetY}`;
   const centerX = (sourceX + targetX) / 2;
@@ -184,6 +232,7 @@ function RelationEdge({ id, sourceX, sourceY, targetX, targetY, data, selected }
           className="react-flow__edge-path"
           d={edgePath}
           stroke={config.color}
+          stroke={dynamicColor}
           strokeWidth={strokeWidth + 2}
           strokeDasharray={strokeDasharray}
           fill="none"
@@ -195,11 +244,12 @@ function RelationEdge({ id, sourceX, sourceY, targetX, targetY, data, selected }
         className="react-flow__edge-path"
         d={edgePath}
         stroke={config.color}
+        stroke={dynamicColor}
         strokeWidth={strokeWidth}
         strokeDasharray={strokeDasharray}
         fill="none"
         opacity={opacity}
-        markerEnd={`url(#arrow-${config.color.replace('#', '')})`}
+        markerEnd={`url(#${markerIdFromRelationLabel(rawLabel)})`}
       />
       {/* 关系标签 */}
       <g transform={`translate(${centerX}, ${centerY})`}>
@@ -211,6 +261,7 @@ function RelationEdge({ id, sourceX, sourceY, targetX, targetY, data, selected }
           rx={4}
           fill="white"
           stroke={config.color}
+          stroke={dynamicColor}
           strokeWidth={data.verified ? 1.5 : 1}
           strokeDasharray={data.verified ? '0' : '4,2'}
           opacity={opacity}
@@ -222,10 +273,11 @@ function RelationEdge({ id, sourceX, sourceY, targetX, targetY, data, selected }
           dominantBaseline="middle"
           fontSize={9}
           fill={config.color}
+          fill={dynamicColor}
           fontWeight={data.verified ? 600 : 400}
           opacity={opacity}
         >
-          {config.label}
+          {String(rawLabel).slice(0, 8)}
         </text>
         {/* 置信度指示 */}
         {data.confidence < 0.7 && (
@@ -422,7 +474,8 @@ function layoutGraph(entities: KGEntity[], relations: KGRelation[]): { nodes: No
   
   // 创建边
   relations.forEach(relation => {
-    const config = RELATION_CONFIG[relation.type as RelationType] || RELATION_CONFIG['其他'];
+    const rawLabel = getRelationRawLabel(relation);
+    const dynamicColor = colorFromLabel(rawLabel, 'relation');
     
     edges.push({
       id: relation.id,
@@ -431,10 +484,10 @@ function layoutGraph(entities: KGEntity[], relations: KGRelation[]): { nodes: No
       type: 'relation',
       animated: !relation.verified,
       data: relation,
-      style: { stroke: config.color, strokeWidth: relation.verified ? 2 : 1 },
+      style: { stroke: dynamicColor, strokeWidth: relation.verified ? 2 : 1 },
       markerEnd: {
         type: MarkerType.ArrowClosed,
-        color: config.color
+        color: dynamicColor
       }
     });
   });
@@ -458,7 +511,58 @@ export default function KnowledgeGraph({
   const [selectedNode, setSelectedNode] = useState<KGEntity | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<KGRelation | null>(null);
   const [showEvolutionHistory, setShowEvolutionHistory] = useState(false);
-  
+  const [actionBusy, setActionBusy] = useState(false);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const pushNotice = useCallback((type: 'success' | 'error', text: string) => {
+    setNotice({ type, text });
+    window.setTimeout(() => setNotice((prev) => (prev?.text === text ? null : prev)), 2200);
+  }, []);
+
+  /** 图例仅展示当前图中实际出现的规范类型（与节点/边颜色一致） */
+  const legendEntityTypes = useMemo(() => {
+    const present = new Set(entities.map((e) => e.type));
+    return ENTITY_ORDER.filter((t) => present.has(t));
+  }, [entities]);
+
+  const legendRelationTypes = useMemo(() => {
+    const present = new Set(relations.map((r) => r.type));
+    return REL_ORDER.filter((t) => present.has(t));
+  }, [relations]);
+
+  /** 动态细粒度类型（来自抽取原始标签），做适度聚合避免过细 */
+  const dynamicEntityLegend = useMemo(() => {
+    const counter = new Map<string, { count: number; canonical: EntityType }>();
+    for (const e of entities) {
+      const label = getEntityRawLabel(e);
+      const old = counter.get(label);
+      if (old) {
+        old.count += 1;
+      } else {
+        counter.set(label, { count: 1, canonical: e.type });
+      }
+    }
+    return Array.from(counter.entries())
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 10);
+  }, [entities]);
+
+  const dynamicRelationLegend = useMemo(() => {
+    const counter = new Map<string, { count: number; canonical: RelationType }>();
+    for (const r of relations) {
+      const label = getRelationRawLabel(r);
+      const old = counter.get(label);
+      if (old) {
+        old.count += 1;
+      } else {
+        counter.set(label, { count: 1, canonical: r.type });
+      }
+    }
+    return Array.from(counter.entries())
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 12);
+  }, [relations]);
+
   // 布局计算
   const { nodes: layoutNodes, edges: layoutEdges } = useMemo(
     () => layoutGraph(entities, relations),
@@ -473,14 +577,21 @@ export default function KnowledgeGraph({
   
   const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges);
+  const lastLayoutKeyRef = useRef<string>('');
+  const graphLayoutKey = useMemo(() => {
+    const entityIds = entities.map((e) => e.id).sort().join('|');
+    const relationIds = relations.map((r) => r.id).sort().join('|');
+    return `${entityIds}::${relationIds}`;
+  }, [entities, relations]);
   
-  // 当布局变化时更新节点和边
+  // 仅在图谱结构变化时重排；避免拖拽后被每次渲染重置位置
   useEffect(() => {
-    if (layoutNodes.length > 0) {
+    if (layoutNodes.length > 0 && lastLayoutKeyRef.current !== graphLayoutKey) {
       setNodes(layoutNodes);
       setEdges(layoutEdges);
+      lastLayoutKeyRef.current = graphLayoutKey;
     }
-  }, [layoutNodes, layoutEdges, setNodes, setEdges]);
+  }, [layoutNodes, layoutEdges, graphLayoutKey, setNodes, setEdges]);
   
   // 节点点击
   const handleNodeClick = useCallback((event: React.MouseEvent, node: Node) => {
@@ -501,6 +612,94 @@ export default function KnowledgeGraph({
       onEdgeClick?.(relation);
     }
   }, [relations, onEdgeClick]);
+
+  const handleConfirmSelected = useCallback(async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      if (selectedNode) {
+        if (isLikelyPersistedId(selectedNode.id)) {
+          const res = await fetch('/api/knowledge-graph/entities', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'update-entity',
+              payload: { id: selectedNode.id, data: { verified: true, source_type: 'expert_verified' } },
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error((err as { error?: string }).error || '确认实体失败');
+          }
+        }
+        setSelectedNode({ ...selectedNode, verified: true });
+        pushNotice('success', '实体已确认');
+      } else if (selectedEdge) {
+        if (isLikelyPersistedId(selectedEdge.id)) {
+          const res = await fetch('/api/knowledge-graph/entities', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'update-relation',
+              payload: { id: selectedEdge.id, data: { verified: true, source_type: 'expert_verified' } },
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error((err as { error?: string }).error || '确认关系失败');
+          }
+        }
+        setSelectedEdge({ ...selectedEdge, verified: true });
+        pushNotice('success', '关系已确认');
+      }
+    } catch (e) {
+      console.error('[KnowledgeGraph] confirm failed', e);
+      pushNotice('error', '确认失败，请稍后重试');
+    } finally {
+      setActionBusy(false);
+    }
+  }, [actionBusy, selectedNode, selectedEdge, pushNotice]);
+
+  const handleQuickEditSelected = useCallback(async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      if (selectedNode) {
+        const nextDesc = window.prompt('编辑实体描述', selectedNode.description || '');
+        if (nextDesc == null) return;
+        const res = await fetch('/api/knowledge-graph/entities', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'update-entity',
+            payload: { id: selectedNode.id, data: { description: nextDesc } },
+          }),
+        });
+        if (!res.ok) throw new Error('编辑实体失败');
+        setSelectedNode({ ...selectedNode, description: nextDesc });
+        pushNotice('success', '实体已更新');
+      } else if (selectedEdge) {
+        const nextEvidence = window.prompt('编辑关系证据', selectedEdge.evidence || '');
+        if (nextEvidence == null) return;
+        const res = await fetch('/api/knowledge-graph/entities', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'update-relation',
+            payload: { id: selectedEdge.id, data: { evidence: nextEvidence } },
+          }),
+        });
+        if (!res.ok) throw new Error('编辑关系失败');
+        setSelectedEdge({ ...selectedEdge, evidence: nextEvidence });
+        pushNotice('success', '关系已更新');
+      }
+    } catch (e) {
+      console.error('[KnowledgeGraph] quick edit failed', e);
+      pushNotice('error', '编辑失败，请稍后重试');
+    } finally {
+      setActionBusy(false);
+    }
+  }, [actionBusy, selectedNode, selectedEdge, pushNotice]);
   
   if (entities.length === 0) {
     return (
@@ -526,9 +725,18 @@ export default function KnowledgeGraph({
         onEdgeClick={handleEdgeClick}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
+        nodesDraggable={true}
+        nodesConnectable={false}
+        elementsSelectable={true}
+        panOnDrag={true}
+        zoomOnScroll={true}
+        zoomOnPinch={true}
+        zoomOnDoubleClick={true}
+        preventScrolling={false}
         fitView
+        fitViewOptions={{ padding: 0.2, minZoom: 0.65, maxZoom: 1.2 }}
         attributionPosition="bottom-left"
-        defaultViewport={{ x: 0, y: 0, zoom: 0.8 }}
+        defaultViewport={{ x: 0, y: 0, zoom: 1 }}
         minZoom={0.3}
         maxZoom={2}
       >
@@ -537,18 +745,21 @@ export default function KnowledgeGraph({
         <MiniMap
           className="!bg-white !border !rounded-lg"
           nodeColor={(node) => {
-            const config = ENTITY_CONFIG[node.data?.type as EntityType];
-            return config?.color || '#6b7280';
+            const rawType =
+              typeof node.data?.properties?.typeLabelRaw === 'string' && node.data.properties.typeLabelRaw.trim()
+                ? node.data.properties.typeLabelRaw.trim()
+                : String(node.data?.type || '实体');
+            return colorFromLabel(rawType, 'entity');
           }}
         />
         
         {/* 定义箭头标记 */}
         <svg style={{ position: 'absolute', width: 0, height: 0 }}>
           <defs>
-            {Object.entries(RELATION_CONFIG).map(([key, config]) => (
+            {dynamicRelationLegend.map(([label]) => (
               <marker
-                key={key}
-                id={`arrow-${config.color.replace('#', '')}`}
+                key={label}
+                id={markerIdFromRelationLabel(label)}
                 viewBox="0 0 10 10"
                 refX="8"
                 refY="5"
@@ -556,40 +767,66 @@ export default function KnowledgeGraph({
                 markerHeight="6"
                 orient="auto-start-reverse"
               >
-                <path d="M 0 0 L 10 5 L 0 10 z" fill={config.color} />
+                <path d="M 0 0 L 10 5 L 0 10 z" fill={colorFromLabel(label, 'relation')} />
               </marker>
             ))}
           </defs>
         </svg>
       </ReactFlow>
       
-      {/* 图例 */}
-      <div className="absolute top-4 left-4 bg-white/95 backdrop-blur px-3 py-2 rounded-lg shadow-lg border text-xs">
-        <div className="font-medium mb-2">实体类型</div>
+      {/* 图例：仅展示动态发现类型 */}
+      <div className="pointer-events-none absolute top-4 left-4 bg-white/95 backdrop-blur px-3 py-2 rounded-lg shadow-lg border text-xs max-w-[320px]">
+        <div className="font-medium mb-2">实体类型（动态发现）</div>
         <div className="flex flex-wrap gap-2 mb-3">
-          {Object.entries(ENTITY_CONFIG).slice(0, 4).map(([type, config]) => {
-            const Icon = IconMap[config.icon];
-            return (
-              <div key={type} className="flex items-center gap-1">
-                <div className="w-3 h-3 rounded" style={{ backgroundColor: config.color }} />
-                <span>{type}</span>
-              </div>
-            );
-          })}
+          {dynamicEntityLegend.length === 0 ? (
+            <span className="text-muted-foreground">—</span>
+          ) : (
+            dynamicEntityLegend.map(([label, meta]) => {
+              const color = colorFromLabel(label, 'entity');
+              return (
+                <div key={label} className="flex items-center gap-1" title={`映射为：${meta.canonical} · ${meta.count}个节点`}>
+                  <div className="w-3 h-3 rounded" style={{ backgroundColor: color }} />
+                  <span>{label}</span>
+                </div>
+              );
+            })
+          )}
         </div>
-        <div className="font-medium mb-2">关系类型</div>
-        <div className="flex flex-wrap gap-2 max-w-[250px]">
-          {Object.entries(RELATION_CONFIG).slice(0, 8).map(([type, config]) => (
-            <div key={type} className="flex items-center gap-1">
-              <div className="w-6 h-0.5" style={{ backgroundColor: config.color }} />
-              <span>{type}</span>
-            </div>
-          ))}
+        <div className="font-medium mb-2">关系类型（动态发现）</div>
+        <div className="flex flex-wrap gap-2 mb-3">
+          {dynamicRelationLegend.length === 0 ? (
+            <span className="text-muted-foreground">—</span>
+          ) : (
+            dynamicRelationLegend.map(([label, meta]) => {
+              const color = colorFromLabel(label, 'relation');
+              return (
+                <div key={label} className="flex items-center gap-1" title={`映射为：${meta.canonical} · ${meta.count}条关系`}>
+                  <div className="w-6 h-0.5" style={{ backgroundColor: color }} />
+                  <span>{label}</span>
+                </div>
+              );
+            })
+          )}
         </div>
       </div>
       
+      {/* 非阻断提示 */}
+      {notice && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
+          <div
+            className={
+              notice.type === 'success'
+                ? 'bg-emerald-600 text-white text-xs px-3 py-1.5 rounded shadow'
+                : 'bg-rose-600 text-white text-xs px-3 py-1.5 rounded shadow'
+            }
+          >
+            {notice.text}
+          </div>
+        </div>
+      )}
+
       {/* 状态说明 */}
-      <div className="absolute top-4 right-4 bg-white/95 backdrop-blur px-3 py-2 rounded-lg shadow-lg border text-xs">
+      <div className="pointer-events-none absolute top-4 right-4 bg-white/95 backdrop-blur px-3 py-2 rounded-lg shadow-lg border text-xs">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1.5">
             {/* 已验证：实线 */}
@@ -609,7 +846,7 @@ export default function KnowledgeGraph({
       </div>
       
       {/* 统计信息和导出按钮 */}
-      <div className="absolute bottom-4 right-4 flex items-center gap-2">
+      <div className="pointer-events-none absolute bottom-4 right-4 flex items-center gap-2">
         <div className="bg-white/95 backdrop-blur px-3 py-2 rounded-lg shadow-lg border text-xs">
           <div className="flex items-center gap-4">
             <div>
@@ -624,7 +861,7 @@ export default function KnowledgeGraph({
         </div>
         
         {/* 导出和保存按钮 */}
-        <div className="flex items-center gap-2">
+        <div className="pointer-events-auto flex items-center gap-2">
           {/* 演化历史按钮 */}
           <Button 
             variant="outline" 
@@ -668,6 +905,56 @@ export default function KnowledgeGraph({
         entityId={selectedNode?.id}
         relationId={selectedEdge?.id}
       />
+
+      {/* 选中详情与快捷操作（恢复节点/边点击后的可见反馈） */}
+      {(selectedNode || selectedEdge) && (
+        <Card className="absolute bottom-4 left-4 w-[340px] bg-white/95 backdrop-blur shadow-lg border z-20 pointer-events-auto">
+          <CardContent className="p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-medium">
+                {selectedNode ? '已选中实体' : '已选中关系'}
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-xs"
+                onClick={() => {
+                  setSelectedNode(null);
+                  setSelectedEdge(null);
+                }}
+              >
+                关闭
+              </Button>
+            </div>
+            {selectedNode ? (
+              <div className="text-xs space-y-1">
+                <div><span className="text-muted-foreground">名称：</span>{selectedNode.name}</div>
+                <div><span className="text-muted-foreground">类型：</span>{getEntityRawLabel(selectedNode)}</div>
+                {selectedNode.description ? (
+                  <div className="line-clamp-2"><span className="text-muted-foreground">描述：</span>{selectedNode.description}</div>
+                ) : null}
+              </div>
+            ) : selectedEdge ? (
+              <div className="text-xs space-y-1">
+                <div><span className="text-muted-foreground">关系：</span>{getRelationRawLabel(selectedEdge)}</div>
+                <div className="line-clamp-2">
+                  <span className="text-muted-foreground">证据：</span>{selectedEdge.evidence || '无'}
+                </div>
+              </div>
+            ) : null}
+            <div className="flex items-center gap-2 pt-1">
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={handleQuickEditSelected} disabled={actionBusy}>
+                <Edit3 className="w-3.5 h-3.5 mr-1" />
+                编辑
+              </Button>
+              <Button size="sm" className="h-7 text-xs" onClick={handleConfirmSelected} disabled={actionBusy}>
+                <Check className="w-3.5 h-3.5 mr-1" />
+                确认
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
@@ -698,14 +985,15 @@ async function saveSnapshot(entities: KGEntity[], relations: KGRelation[]) {
     const result = await response.json();
     
     if (response.ok) {
-      alert('快照保存成功！');
+      // 使用非阻断提示，避免打断图谱操作
+      console.info('[KnowledgeGraph] 快照保存成功');
     } else {
       console.error('Save snapshot failed:', result.error);
-      alert('快照保存失败：' + result.error);
+      console.warn('[KnowledgeGraph] 快照保存失败：' + result.error);
     }
   } catch (error) {
     console.error('Save snapshot error:', error);
-    alert('快照保存失败');
+    console.warn('[KnowledgeGraph] 快照保存失败');
   }
 }
 

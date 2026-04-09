@@ -6,6 +6,7 @@ import {
   getAgentRecommendationService,
   type AgentRecommendationResult,
 } from '@/lib/recommendation/agent-recommendation-service';
+import type { UserProfile } from '@/lib/recommendation/types';
 import { advancedWebSearch, getWebSearchProvider } from '@/lib/search/advanced-web-search';
 import { createLLMClient } from '@/lib/llm/create-llm-client';
 import type { LLMClient } from 'coze-coding-dev-sdk';
@@ -57,8 +58,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const userProfile =
-      bodyUserProfile ?? (typeof userId === 'string' && userId ? { userId } : undefined);
     const sessionContext = {
       ...(typeof bodySessionContext === 'object' && bodySessionContext ? bodySessionContext : {}),
       ...(typeof context === 'object' && context ? context : {}),
@@ -68,6 +67,45 @@ export async function POST(request: NextRequest) {
     console.log('[Recommendation API] Processing query:', query);
 
     const memoryManager = getSupabaseRecommendationMemoryManager();
+
+    let mergedUserProfile: UserProfile | undefined;
+    if (typeof userId === 'string' && userId.trim()) {
+      try {
+        mergedUserProfile = await memoryManager.getUserProfile(userId.trim());
+      } catch (e) {
+        console.warn('[Recommendation API] getUserProfile:', e);
+      }
+    }
+    if (bodyUserProfile && typeof bodyUserProfile === 'object') {
+      const b = bodyUserProfile as Record<string, unknown>;
+      const uid =
+        (typeof b.userId === 'string' && b.userId) ||
+        mergedUserProfile?.userId ||
+        (typeof userId === 'string' ? userId : '');
+      mergedUserProfile = {
+        userId: uid,
+        interests: [
+          ...new Set([
+            ...(mergedUserProfile?.interests || []),
+            ...((b.interests as string[] | undefined) || []),
+          ]),
+        ],
+        preferences: {
+          ...(mergedUserProfile?.preferences || {}),
+          ...((b.preferences as Record<string, unknown>) || {}),
+        },
+        behaviorHistory: mergedUserProfile?.behaviorHistory || [],
+        demographics:
+          (b.demographics as UserProfile['demographics']) ?? mergedUserProfile?.demographics,
+      };
+    } else if (!mergedUserProfile && typeof userId === 'string' && userId) {
+      mergedUserProfile = {
+        userId,
+        interests: [],
+        preferences: {},
+        behaviorHistory: [],
+      };
+    }
 
     if (!skipSufficiencyCheck) {
       console.log('[Recommendation API] Starting sufficiency evaluation...');
@@ -156,9 +194,16 @@ export async function POST(request: NextRequest) {
 
     let agentResult: AgentRecommendationResult;
     try {
+      const sessionHints =
+        sessionContext && typeof sessionContext === 'object'
+          ? JSON.stringify(sessionContext).slice(0, 900)
+          : undefined;
+
       agentResult = await agentService.generateRecommendations(query, {
         scenario,
         webContext: webContext || undefined,
+        userProfile: mergedUserProfile,
+        sessionHints,
       });
     } catch (recErr: unknown) {
       console.error('[Recommendation API] Agent recommendation failed:', recErr);
@@ -209,19 +254,27 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const items = agentResult.items.map((it) => ({
+    const items = agentResult.items.map((it) => {
+      const ex0 = it.explanations?.[0];
+      const diff =
+        ex0 && 'differentiator' in ex0 && typeof ex0.differentiator === 'string' && ex0.differentiator.trim()
+          ? ` ｜对比：${ex0.differentiator.trim()}`
+          : '';
+      const explanationLine = `${ex0?.reason || ''}${diff}`.trim();
+      return {
       id: it.id,
       title: it.title,
       type: (it.metadata as { type?: string } | undefined)?.type || 'general',
       description: it.description,
       score: it.score,
       confidence: it.confidence,
-      explanation: it.explanations?.[0]?.reason || '',
+      explanation: explanationLine,
       explanations: it.explanations,
       source: it.source,
       sourceUrl: it.sourceUrl,
       metadata: it.metadata,
-    }));
+    };
+    });
 
     const recommendations = {
       items,
@@ -236,10 +289,10 @@ export async function POST(request: NextRequest) {
       },
     };
 
-    if (userProfile?.userId) {
+    if (mergedUserProfile?.userId) {
       try {
         await memoryManager.recordRecommendationImpression({
-          userId: userProfile.userId,
+          userId: mergedUserProfile.userId,
           returnedItemCount: items.length,
         });
       } catch (error) {

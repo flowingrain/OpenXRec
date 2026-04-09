@@ -171,6 +171,8 @@ export interface RecommendationFilter {
  */
 export interface RecommendationContext {
   time: number;
+  /** 当前用户查询（智能体节点与解释生成使用） */
+  query?: string;
   device?: string;
   location?: string;
   session?: {

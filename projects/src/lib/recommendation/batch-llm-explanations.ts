@@ -40,10 +40,11 @@ export async function enrichRecommendationsWithBatchLLM(
       source: typeof it.source === 'string' ? it.source.slice(0, 80) : '',
     }));
 
-    const user = `用户需求/查询：
+    const user = `用户查询（请站在用户角度，用「您」称呼）：
 ${query}
 
-以下为待解释的推荐项（请按顺序为每一项写一条中文「推荐理由」，1～2 句，说明与用户需求的相关性；若含 url 可简要提示「可打开链接查看」；勿编造不存在的网站或课程名）：
+以下为待解释的推荐项。请按顺序为每一项写一条「推荐理由」：1～2 句，写清**本条如何匹配查询中的具体诉求**；若有多条，可轻微点出**彼此差异**（适合人群或场景）；若含 url 可提示「可打开链接查看」；勿编造不存在的网站或课程名。
+
 ${JSON.stringify(brief, null, 2)}
 
 只输出一个 JSON 对象，格式严格为：
