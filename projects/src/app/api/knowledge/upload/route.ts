@@ -16,6 +16,7 @@ import { getKnowledgeAccumulator, DocumentType, UploadedDocument } from '@/lib/k
 import { uploadKnowledgeDoc } from '@/lib/storage/object-storage';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { embeddingService } from '@/lib/embedding/service';
+import type { KnowledgeEntry } from '@/lib/knowledge';
 
 // ==================== 文档解析工具 ====================
 
@@ -117,6 +118,7 @@ function getDocumentType(filename: string): DocumentType {
 
 export async function POST(request: NextRequest) {
   try {
+    const supabase = getSupabaseClient();
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
     const content = formData.get('content') as string | null;
@@ -210,8 +212,6 @@ export async function POST(request: NextRequest) {
     // 保存元数据到 Supabase
     let dbRecord = null;
     try {
-      const supabase = getSupabaseClient();
-      
       const { data, error } = await supabase
         .from('knowledge_docs')
         .insert({
@@ -238,12 +238,137 @@ export async function POST(request: NextRequest) {
       console.warn('Failed to save to Supabase:', e);
     }
     
-    // 自动提取知识
+    // 自动提取知识（先 dry-run，不直接入知识层）
     let extractionResult = null;
+    let pipelineResult: {
+      extracted: number;
+      normalized: number;
+      passedConfidence: number;
+      conflicts: number;
+      persisted: number;
+      traceId: string;
+    } | null = null;
     
     if (autoExtract && parsed.text.length > 50) {
       const accumulator = getKnowledgeAccumulator();
-      extractionResult = await accumulator.extractFromDocument(document);
+      const traceId = `trace_${documentId}_${Date.now()}`;
+      extractionResult = await accumulator.extractFromDocument(document, {
+        persistToKnowledge: false,
+      });
+
+      const extractedEntries = extractionResult.entries || [];
+
+      // 2) 归一化：标题/内容清洗 + 置信度边界修正 + 可追溯标签
+      const normalizedEntries: KnowledgeEntry[] = extractedEntries.map((entry) => {
+        const title = (entry.title || '').trim().slice(0, 200);
+        const content = (entry.content || '').replace(/\s+/g, ' ').trim().slice(0, 4000);
+        const confidenceRaw = Number(entry.metadata?.confidence ?? 0.7);
+        const confidence = Math.max(0, Math.min(1, Number.isFinite(confidenceRaw) ? confidenceRaw : 0.7));
+        const tags = Array.from(
+          new Set([
+            ...(entry.metadata?.tags || []),
+            `trace:${traceId}`,
+            `doc:${documentId}`,
+          ])
+        ).slice(0, 20);
+        return {
+          ...entry,
+          title: title || '未命名知识点',
+          content: content || '（空内容）',
+          metadata: {
+            ...entry.metadata,
+            source: `${document.filename}#${documentId}`,
+            confidence,
+            tags,
+          },
+        };
+      });
+
+      // 3) 置信度门禁
+      const confidenceThreshold = 0.65;
+      const confidencePassed = normalizedEntries.filter((e) => (e.metadata?.confidence ?? 0) >= confidenceThreshold);
+
+      // 4) 冲突检测（轻量）：与现有知识文档语义高相似且文本差异较大判定冲突候选
+      const conflictFree: KnowledgeEntry[] = [];
+      const conflictCandidates: Array<{
+        id: string;
+        title: string;
+        content: string;
+        confidence: number;
+        source: string;
+        existingTitle?: string;
+        existingContent?: string;
+        similarity?: number;
+      }> = [];
+      let conflictCount = 0;
+      for (const entry of confidencePassed) {
+        try {
+          const sims = await embeddingService.searchKnowledge(`${entry.title}\n${entry.content}`.slice(0, 500), {
+            limit: 1,
+            threshold: 0.9,
+          });
+          const best = sims[0];
+          const highlySimilar = !!best && best.similarity >= 0.92;
+          const differentText =
+            !!best &&
+            (best.title || '').trim() !== entry.title.trim() &&
+            (best.content || '').slice(0, 120) !== entry.content.slice(0, 120);
+          if (highlySimilar && differentText) {
+            conflictCount += 1;
+            conflictCandidates.push({
+              id: entry.id,
+              title: entry.title,
+              content: entry.content,
+              confidence: entry.metadata?.confidence ?? 0.7,
+              source: entry.metadata?.source || `${document.filename}#${documentId}`,
+              existingTitle: best?.title,
+              existingContent: best?.content,
+              similarity: best?.similarity,
+            });
+            continue;
+          }
+        } catch {
+          // 冲突检测失败时不阻断主流程，按无冲突处理
+        }
+        conflictFree.push(entry);
+      }
+
+      // 5) 可追溯来源：通过 source + trace/doc tags 实现；门禁通过后再入知识层
+      await accumulator.persistExtractedEntries(conflictFree, 'document_upload');
+
+      // 4.5) 将冲突候选写入审查池（knowledge_patterns），供人工确认后再入知识层
+      if (conflictCandidates.length > 0) {
+        try {
+          await supabase.from('knowledge_patterns').insert(
+            conflictCandidates.map((c, idx) => ({
+              id: `kp_conflict_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 8)}`,
+              pattern_type: 'knowledge_conflict',
+              name: `文档知识冲突候选: ${c.title.slice(0, 40)}`,
+              description: `文档上传门禁拦截：与现有知识高相似但文本差异明显（trace=${traceId}）`,
+              pattern_data: {
+                stage: 'upload_pipeline_conflict_gate',
+                traceId,
+                documentId,
+                candidate: c,
+              },
+              occurrence_count: 1,
+              confidence: Math.min(0.99, Math.max(0.5, c.confidence)),
+              is_verified: false,
+            }))
+          );
+        } catch (e) {
+          console.warn('[Knowledge Upload] failed to persist conflict candidates:', e);
+        }
+      }
+
+      pipelineResult = {
+        extracted: extractedEntries.length,
+        normalized: normalizedEntries.length,
+        passedConfidence: confidencePassed.length,
+        conflicts: conflictCount,
+        persisted: conflictFree.length,
+        traceId,
+      };
     }
     
     // 自动生成嵌入向量（后台异步执行）
@@ -282,10 +407,11 @@ export async function POST(request: NextRequest) {
           entriesCount: extractionResult.entries.length,
           confidence: extractionResult.confidence,
           entries: extractionResult.entries.slice(0, 5) // 只返回前5条预览
-        } : null
+        } : null,
+        pipeline: pipelineResult,
       },
       message: extractionResult 
-        ? `文档上传成功，提取了 ${extractionResult.entries.length} 条知识${embeddingStatus === 'generating' ? '，正在生成向量嵌入...' : ''}`
+        ? `文档上传成功，抽取 ${pipelineResult?.extracted ?? extractionResult.entries.length} 条，入知识层 ${pipelineResult?.persisted ?? extractionResult.entries.length} 条${embeddingStatus === 'generating' ? '，正在生成向量嵌入...' : ''}`
         : `文档上传成功${embeddingStatus === 'generating' ? '，正在生成向量嵌入...' : ''}`
     });
     

@@ -41,6 +41,9 @@ export interface AgentRecommendationResult {
     confidence: number;
     reasoningChain: string[];
     queryType?: 'recommendation' | 'comparison_analysis';  // 区分推荐型和对比分析型
+    userSegment?: UserSegmentProfile;
+    templateId?: string;
+    [key: string]: unknown;
   };
 }
 
@@ -91,6 +94,32 @@ export interface AgentServiceConfig {
   maxAgentsParallel?: number;  // 最大并行智能体数
   /** 最终返回条数上限（默认 5，API 可传入与 RECOMMENDATION_MAX_ITEMS 对齐） */
   maxReturnItems?: number;
+}
+
+type TaskComplexity = 'simple' | 'moderate' | 'complex';
+
+interface RecommendationExecutionPlan {
+  complexity: TaskComplexity;
+  useSimilarity: boolean;
+  useKnowledgeGraphReasoning: boolean;
+  useCausalReasoning: boolean;
+  useDiversityOptimizer: boolean;
+}
+
+interface UserSegmentProfile {
+  segment: string;
+  experienceLevel: string;
+  riskPreference: string;
+  timeHorizon: string;
+  primaryGoals: string[];
+}
+
+interface KGEvidence {
+  relation: string;
+  confidence: number;
+  kind: 'association' | 'causal_hint';
+  path?: string;
+  evidence?: string;
 }
 
 // ============================================================================
@@ -159,6 +188,10 @@ export class AgentRecommendationService {
         return this.generateComparisonAnalysis(query, context, intentResult);
       }
 
+      const executionPlan = this.planExecutionByComplexity(query, context, intentResult);
+      console.log('[AgentRecommendationService] Execution plan:', executionPlan);
+      const userSegment = this.buildUserSegmentProfile(query, context);
+
       // ========================================
       // 阶段2：候选生成（LLM + 外部知识）
       // ========================================
@@ -178,23 +211,23 @@ export class AgentRecommendationService {
       // ========================================
       // 阶段3.1：相似度计算智能体（高优先级优化）
       // ========================================
-      console.log('[AgentRecommendationService] Phase 3.1: Similarity Calculator Agent');
-      const similarities = await this.runSimilarityCalculator(itemsWithFeatures, query, context);
-      agentsUsed.push('similarity_calculator');
+      const similarityTask = executionPlan.useSimilarity
+        ? this.runSimilarityCalculator(itemsWithFeatures, query, context)
+        : Promise.resolve(new Map<string, number>());
+      const kgTask = executionPlan.useKnowledgeGraphReasoning
+        ? this.runKGReasoner(query, itemsWithFeatures)
+        : Promise.resolve(new Map<string, KGEvidence[]>());
 
-      // ========================================
-      // 阶段3.2：知识图谱推理智能体（中优先级优化）
-      // ========================================
-      console.log('[AgentRecommendationService] Phase 3.2: Knowledge Graph Reasoning Agent');
-      const kgRelations = await this.runKGReasoner(query, itemsWithFeatures);
-      agentsUsed.push('kg_reasoner');
-
-      // ========================================
-      // 阶段3.3：因果推理智能体（中优先级优化）
-      // ========================================
-      console.log('[AgentRecommendationService] Phase 3.3: Causal Reasoning Agent');
-      const causalChain = await this.runCausalReasoner(query, itemsWithFeatures);
-      agentsUsed.push('causal_reasoner');
+      const [similarities, kgRelations] = await Promise.all([
+        similarityTask,
+        kgTask,
+      ]);
+      const causalChain = executionPlan.useCausalReasoning
+        ? await this.runCausalReasoner(query, itemsWithFeatures, kgRelations)
+        : new Map<string, string>();
+      if (executionPlan.useSimilarity) agentsUsed.push('similarity_calculator');
+      if (executionPlan.useKnowledgeGraphReasoning) agentsUsed.push('kg_reasoner');
+      if (executionPlan.useCausalReasoning) agentsUsed.push('causal_reasoner');
 
       // ========================================
       // 阶段4：评分与排序智能体（增强版）
@@ -206,7 +239,8 @@ export class AgentRecommendationService {
         context,
         similarities,
         causalChain,
-        kgRelations
+        kgRelations,
+        userSegment
       );
       agentsUsed.push('ranking_agent');
 
@@ -222,16 +256,22 @@ export class AgentRecommendationService {
           userProfile: context.userProfile ?? undefined,
           sessionHints: context.sessionHints,
         },
-        intentResult
+        intentResult,
+        userSegment,
+        kgRelations,
+        causalChain
       );
       agentsUsed.push('explanation_generator');
 
       // ========================================
       // 阶段6：多样性优化智能体
       // ========================================
-      console.log('[AgentRecommendationService] Phase 6: Diversity Optimization Agent');
-      const optimizedItems = await this.runDiversityOptimizer(itemsWithExplanations);
-      agentsUsed.push('diversity_optimizer');
+      let optimizedItems = itemsWithExplanations;
+      if (executionPlan.useDiversityOptimizer) {
+        console.log('[AgentRecommendationService] Phase 6: Diversity Optimization Agent');
+        optimizedItems = await this.runDiversityOptimizer(itemsWithExplanations);
+        agentsUsed.push('diversity_optimizer');
+      }
 
       // ========================================
       // 异步：配置优化智能体（低优先级优化）
@@ -269,12 +309,13 @@ export class AgentRecommendationService {
       return {
         items: optimizedItems.slice(0, maxItems),
         strategy: this.determineStrategy(context.sources),
-        explanation: this.generateOverallExplanation(intentResult, optimizedItems),
+        explanation: this.generateOverallExplanation(intentResult, optimizedItems, userSegment),
         metadata: {
           agentsUsed,
           confidence: avgConfidence,
           reasoningChain,
           queryType: 'recommendation' as const,
+          userSegment,
         },
       };
     } catch (error) {
@@ -284,6 +325,73 @@ export class AgentRecommendationService {
       console.log('[AgentRecommendationService] Falling back to direct LLM generation');
       return this.fallbackGeneration(query, context);
     }
+  }
+
+  /**
+   * 基于任务复杂度动态编排推荐智能体。
+   * - simple：轻链路（相似度 + 排序 + 解释）
+   * - moderate：中链路（加入 KG）
+   * - complex：全链路（KG + 因果 + 多样性）
+   */
+  private planExecutionByComplexity(
+    query: string,
+    context: {
+      webContext?: string;
+      knowledgeContext?: string;
+      userProfile?: Partial<UserProfile> | null;
+      sessionHints?: string;
+    },
+    intentResult: {
+      recommendationType?: string;
+      informationSufficiency?: { score?: number; isSufficient?: boolean; missingFields?: string[] };
+      entities?: Array<{ name: string; type: string }>;
+      constraints?: Array<{ name: string; value: string }>;
+    }
+  ): RecommendationExecutionPlan {
+    if (this.config.useFullPipeline) {
+      return {
+        complexity: 'complex',
+        useSimilarity: true,
+        useKnowledgeGraphReasoning: !this.config.skipKnowledgeGraph,
+        useCausalReasoning: true,
+        useDiversityOptimizer: true,
+      };
+    }
+
+    const queryLen = query.length;
+    const hasExternalContext = Boolean(context.webContext || context.knowledgeContext);
+    const hasProfile = Boolean(
+      context.userProfile?.interests?.length ||
+      (context.userProfile?.preferences && Object.keys(context.userProfile.preferences).length > 0)
+    );
+    const entityCount = intentResult.entities?.length || 0;
+    const constraintCount = intentResult.constraints?.length || 0;
+    const missingCount = intentResult.informationSufficiency?.missingFields?.length || 0;
+    const suffScore = intentResult.informationSufficiency?.score ?? 0.5;
+    const recType = intentResult.recommendationType || 'comparison';
+
+    let complexity: TaskComplexity = 'simple';
+    const complexSignals =
+      queryLen > 35 || hasExternalContext || entityCount >= 3 || constraintCount >= 2 || missingCount >= 2;
+    const moderateSignals =
+      queryLen > 18 || entityCount >= 2 || constraintCount >= 1 || recType === 'ranking' || hasProfile;
+
+    if (complexSignals) complexity = 'complex';
+    else if (moderateSignals) complexity = 'moderate';
+    if (suffScore < 0.55 && complexity !== 'complex') complexity = 'moderate';
+
+    const useKnowledgeGraphReasoning =
+      !this.config.skipKnowledgeGraph && (complexity === 'complex' || complexity === 'moderate');
+    const useCausalReasoning = complexity === 'complex' && suffScore >= 0.5;
+    const useDiversityOptimizer = complexity !== 'simple' || recType === 'comparison';
+
+    return {
+      complexity,
+      useSimilarity: true,
+      useKnowledgeGraphReasoning,
+      useCausalReasoning,
+      useDiversityOptimizer,
+    };
   }
 
   // ============================================================================
@@ -503,8 +611,10 @@ ${candidates.map((c, i) => `${i + 1}. [${c.id}] ${c.title}\n   ${c.description}`
     try {
       const jsonMatch = response.content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        const featureMap = new Map(parsed.items.map((item: any) => [item.id, item]));
+        const parsed = JSON.parse(jsonMatch[0]) as { items?: Array<{ id: string; features?: Record<string, any>; relevanceScore?: number; matchReasons?: string[] }> };
+        const featureMap = new Map<string, { id: string; features?: Record<string, any>; relevanceScore?: number; matchReasons?: string[] }>(
+          (parsed.items || []).map((item) => [item.id, item])
+        );
         
         return candidates.map(c => {
           const features = featureMap.get(c.id);
@@ -603,20 +713,30 @@ ${items.map((item, i) => `${i + 1}. [${item.id}] ${item.title} - ${item.descript
   private async runKGReasoner(
     query: string,
     items: Array<{ id: string; title: string }>
-  ): Promise<Map<string, Array<{ relation: string; confidence: number }>>> {
+  ): Promise<Map<string, KGEvidence[]>> {
     console.log('[KGReasoner] Performing knowledge graph reasoning');
 
     const entities = items.map(item => ({
       id: item.id,
       name: item.title,
     }));
+    const scopedKGContext = this.buildScopedKGContext(query, items);
 
-    const prompt = `分析用户查询和推荐项之间的潜在关系。
+    const prompt = `你将基于“局部相关子图”进行推理，不要假设全图信息。
+
+请区分：
+- association：共现/相关/相似/互补（非因果）
+- causal_hint：可能存在方向性的影响线索（仅提示，不等同已证实因果）
+
+分析用户查询和推荐项之间的潜在关系。
 
 用户查询：${query}
 
 推荐实体：
 ${entities.map((e, i) => `${i + 1}. [${e.id}] ${e.name}`).join('\n')}
+
+局部子图证据（已按关键词过滤）：
+${scopedKGContext || '无可用局部子图，仅基于查询与候选标题推理'}
 
 请分析这些实体之间的关系类型，返回JSON：
 {
@@ -624,8 +744,20 @@ ${entities.map((e, i) => `${i + 1}. [${e.id}] ${e.name}`).join('\n')}
     {
       "id": "rec_1",
       "relations": [
-        { "type": "相似", "confidence": 0.8 },
-        { "type": "补充", "confidence": 0.7 }
+        {
+          "type": "相关",
+          "kind": "association",
+          "confidence": 0.8,
+          "path": "A -> B",
+          "evidence": "来自局部子图的相关关系"
+        },
+        {
+          "type": "影响",
+          "kind": "causal_hint",
+          "confidence": 0.68,
+          "path": "A -> C -> B",
+          "evidence": "方向性线索，待因果模块验证"
+        }
       ]
     }
   ]
@@ -643,9 +775,19 @@ ${entities.map((e, i) => `${i + 1}. [${e.id}] ${e.name}`).join('\n')}
       const jsonMatch = response.content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
-        const relationMap = new Map<string, Array<{ relation: string; confidence: number }>>();
+        const relationMap = new Map<string, KGEvidence[]>();
         parsed.relations.forEach((r: any) => {
-          relationMap.set(r.id, r.relations);
+          const relations = Array.isArray(r.relations) ? r.relations : [];
+          relationMap.set(
+            r.id,
+            relations.map((x: any) => ({
+              relation: x.type || '关联',
+              confidence: Number(x.confidence) || 0.6,
+              kind: x.kind === 'causal_hint' ? 'causal_hint' : 'association',
+              path: typeof x.path === 'string' ? x.path : undefined,
+              evidence: typeof x.evidence === 'string' ? x.evidence : undefined,
+            }))
+          );
         });
         console.log('[KGReasoner] Found', relationMap.size, 'relations');
         return relationMap;
@@ -665,7 +807,8 @@ ${entities.map((e, i) => `${i + 1}. [${e.id}] ${e.name}`).join('\n')}
    */
   private async runCausalReasoner(
     query: string,
-    items: Array<{ id: string; title: string; description: string }>
+    items: Array<{ id: string; title: string; description: string }>,
+    kgRelations?: Map<string, KGEvidence[]>
   ): Promise<Map<string, string>> {
     console.log('[CausalReasoner] Performing causal reasoning');
 
@@ -675,6 +818,16 @@ ${entities.map((e, i) => `${i + 1}. [${e.id}] ${e.name}`).join('\n')}
 
 推荐项目：
 ${items.map((item, i) => `${i + 1}. [${item.id}] ${item.title} - ${item.description.substring(0, 80)}`).join('\n')}
+
+知识图谱因果线索（causal_hint）：
+${items.map((item) => {
+  const hints = (kgRelations?.get(item.id) || [])
+    .filter((r) => r.kind === 'causal_hint')
+    .slice(0, 3)
+    .map((r) => `${r.relation}(${(r.confidence * 100).toFixed(0)}%) ${r.path || ''}`.trim())
+    .join('；');
+  return `- ${item.id}: ${hints || '无'}`;
+}).join('\n')}
 
 请为每个推荐项目生成因果推理链，返回JSON：
 {
@@ -730,7 +883,8 @@ ${items.map((item, i) => `${i + 1}. [${item.id}] ${item.title} - ${item.descript
     context: { knowledgeContext?: string; webContext?: string },
     similarities?: Map<string, number>,
     causalChain?: Map<string, string>,
-    kgRelations?: Map<string, Array<{ relation: string; confidence: number }>>
+    kgRelations?: Map<string, KGEvidence[]>,
+    userSegment?: UserSegmentProfile
   ): Promise<Array<{
     id: string;
     title: string;
@@ -742,7 +896,7 @@ ${items.map((item, i) => `${i + 1}. [${item.id}] ${item.title} - ${item.descript
     matchReasons: string[];
     similarityScore?: number;
     causalReasoning?: string;
-    kgRelationInfo?: Array<{ relation: string; confidence: number }>;
+    kgRelationInfo?: KGEvidence[];
   }>> {
     console.log('[RankingAgent] Enhanced ranking with', {
       similarities: similarities?.size || 0,
@@ -753,6 +907,9 @@ ${items.map((item, i) => `${i + 1}. [${item.id}] ${item.title} - ${item.descript
     const prompt = `对以下推荐候选进行综合评分排序。
 
 用户查询：${query}
+
+用户画像区分：
+${userSegment ? JSON.stringify(userSegment, null, 2) : '未提供，按通用用户排序'}
 
 候选项目：
 ${items.map((item, i) => {
@@ -765,7 +922,7 @@ ${i + 1}. [${item.id}] ${item.title}
    相关性：${item.relevanceScore}
    相似度：${similarity?.toFixed(2) || 'N/A'}
    因果推理：${causal || '无'}
-   知识图谱关系：${kgRel?.map(r => `${r.relation}(${(r.confidence * 100).toFixed(0)}%)`).join(', ') || '无'}
+   知识图谱关系：${kgRel?.map(r => `${r.kind === 'causal_hint' ? '因果线索' : '关联'}:${r.relation}(${(r.confidence * 100).toFixed(0)}%)`).join(', ') || '无'}
    匹配原因：${item.matchReasons?.join('、') || '未知'}
 `;
 }).join('\n')}
@@ -801,8 +958,12 @@ ${i + 1}. [${item.id}] ${item.title}
     try {
       const jsonMatch = response.content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        const rankingMap = new Map(parsed.rankings.map((r: any) => [r.id, r]));
+        const parsed = JSON.parse(jsonMatch[0]) as {
+          rankings?: Array<{ id: string; score?: number; confidence?: number; rankingReasons?: string[] }>;
+        };
+        const rankingMap = new Map<string, { id: string; score?: number; confidence?: number; rankingReasons?: string[] }>(
+          (parsed.rankings || []).map((r) => [r.id, r])
+        );
 
         return items.map(item => {
           const ranking = rankingMap.get(item.id);
@@ -844,6 +1005,13 @@ ${i + 1}. [${item.id}] ${item.title}
     }
   ): Promise<string> {
     const parts: string[] = [];
+    const segment = this.buildUserSegmentProfile(query, context);
+    parts.push(
+      `画像分层：${segment.segment}；经验层次=${segment.experienceLevel}；风险偏好=${segment.riskPreference}；时间视野=${segment.timeHorizon}`
+    );
+    if (segment.primaryGoals.length) {
+      parts.push(`核心目标：${segment.primaryGoals.join('、')}`);
+    }
     const p = context.userProfile;
     if (p?.interests?.length) {
       parts.push(`兴趣与关注：${p.interests.join('、')}`);
@@ -871,6 +1039,52 @@ ${i + 1}. [${item.id}] ${item.title}
       return this.inferPersonaFromQuery(query);
     }
     return ['【用户画像与情境】', ...parts].join('\n');
+  }
+
+  private buildUserSegmentProfile(
+    query: string,
+    context: {
+      userProfile?: Partial<UserProfile> | null;
+      sessionHints?: string;
+    }
+  ): UserSegmentProfile {
+    const p = context.userProfile;
+    const pref = (p?.preferences || {}) as Record<string, unknown>;
+    const text = `${query} ${context.sessionHints || ''}`.toLowerCase();
+
+    const experienceLevel =
+      (typeof pref.experienceLevel === 'string' && pref.experienceLevel) ||
+      (typeof pref.level === 'string' && pref.level) ||
+      (/入门|新手|基础|从零/.test(text) ? 'beginner' : /进阶|深入|系统|专业/.test(text) ? 'advanced' : 'intermediate');
+
+    const riskPreference =
+      (typeof pref.riskPreference === 'string' && pref.riskPreference) ||
+      (typeof pref.risk === 'string' && pref.risk) ||
+      (/保守|稳健|低风险/.test(text) ? 'conservative' : /激进|高风险|收益最大/.test(text) ? 'aggressive' : 'balanced');
+
+    const timeHorizon =
+      (typeof pref.timeHorizon === 'string' && pref.timeHorizon) ||
+      (/短期|尽快|马上|本周/.test(text) ? 'short_term' : /长期|体系|长期规划/.test(text) ? 'long_term' : 'mid_term');
+
+    const explicitGoals = Array.isArray(pref.goals) ? pref.goals.filter(Boolean).map(String) : [];
+    const inferredGoals: string[] = [];
+    if (/学习|课程|教程|资料/.test(text)) inferredGoals.push('系统学习');
+    if (/实战|项目|落地|部署/.test(text)) inferredGoals.push('实战应用');
+    if (/比较|对比|选型|优缺点/.test(text)) inferredGoals.push('方案对比决策');
+
+    const segment =
+      (typeof pref.segment === 'string' && pref.segment.trim()) ||
+      (typeof pref.role === 'string' && pref.role.trim()) ||
+      (typeof p?.demographics?.occupation === 'string' && p.demographics.occupation.trim()) ||
+      '通用用户';
+
+    return {
+      segment,
+      experienceLevel,
+      riskPreference,
+      timeHorizon,
+      primaryGoals: Array.from(new Set([...explicitGoals, ...inferredGoals])).slice(0, 4),
+    };
   }
 
   /** 无长期画像时从本次查询推断诉求（短文本） */
@@ -922,7 +1136,10 @@ ${query}
       sessionHints?: string;
     },
     intentResult: any,
-    userPerspective: string
+    userPerspective: string,
+    userSegment?: UserSegmentProfile,
+    kgRelations?: Map<string, KGEvidence[]>,
+    causalChain?: Map<string, string>
   ): Promise<AgentRecommendationItem[] | null> {
     const brief = items.map((it, i) => ({
       rank: i + 1,
@@ -942,6 +1159,9 @@ ${query}
 ## 用户画像与情境（含显式画像与/或从查询推断；请区分事实与推断）
 ${userPerspective}
 
+## 用户画像分层标签（用于差异化推荐）
+${userSegment ? JSON.stringify(userSegment, null, 2) : '未提供'}
+
 ## 意图
 - 场景：${intentResult.scenarioType}
 - 推荐形态：${intentResult.recommendationType}
@@ -950,6 +1170,15 @@ ${userPerspective}
 
 ## 待解释列表（已排序，rank 越小越靠前）
 ${JSON.stringify(brief, null, 2)}
+
+## 每个候选的证据（区分关联与因果）
+${items.map((it) => {
+  const kg = (kgRelations?.get(it.id) || []).slice(0, 4)
+    .map((k) => `${k.kind === 'causal_hint' ? '因果线索' : '关联'}:${k.relation}(${(k.confidence * 100).toFixed(0)}%)`)
+    .join('；');
+  const causal = causalChain?.get(it.id) || '无';
+  return `- ${it.id} KG=${kg || '无'} | 因果=${causal}`;
+}).join('\n')}
 
 ## 可用背景（勿编造不存在的链接或机构）
 ${context.knowledgeContext ? `知识片段：${context.knowledgeContext.slice(0, 550)}` : ''}
@@ -1010,7 +1239,12 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
         explanations: [
           {
             type: row?.type || 'feature_similarity',
-            reason,
+            reason: this.formatEvidenceChainReason(
+              reason,
+              this.composeKGEvidenceLine(item.id, kgRelations),
+              this.composeCausalEvidenceLine(item.id, causalChain),
+              this.composeUserMatchLine(item.matchReasons, userSegment)
+            ),
             differentiator:
               typeof row?.differentiator === 'string' ? row.differentiator.trim() : undefined,
             factors: Array.isArray(row?.factors) ? row.factors : [],
@@ -1021,6 +1255,7 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
         metadata: {
           features: item.features,
           matchReasons: item.matchReasons,
+          comparison: this.buildComparisonMetadata(item, items),
         },
       };
     });
@@ -1050,7 +1285,10 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
       userProfile?: Partial<UserProfile> | null;
       sessionHints?: string;
     },
-    intentResult: any
+    intentResult: any,
+    userSegment?: UserSegmentProfile,
+    kgRelations?: Map<string, KGEvidence[]>,
+    causalChain?: Map<string, string>
   ): Promise<AgentRecommendationItem[]> {
     console.log('[ExplanationGenerator] Generating explanations for', items.length, 'items');
 
@@ -1063,7 +1301,10 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
           query,
           context,
           intentResult,
-          userPerspective
+          userPerspective,
+          userSegment,
+          kgRelations,
+          causalChain
         );
         if (contrast) {
           return contrast;
@@ -1080,7 +1321,10 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
           query,
           context,
           intentResult,
-          userPerspective
+          userPerspective,
+          userSegment,
+          kgRelations?.get(item.id),
+          causalChain?.get(item.id)
         );
 
         return {
@@ -1094,6 +1338,7 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
           metadata: {
             features: item.features,
             matchReasons: item.matchReasons,
+            comparison: this.buildComparisonMetadata(item, items),
           },
         };
       })
@@ -1119,7 +1364,10 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
     query: string,
     context: { knowledgeContext?: string; webContext?: string; sources?: string[] },
     intentResult: any,
-    userPerspective: string
+    userPerspective: string,
+    userSegment?: UserSegmentProfile,
+    kgEvidence?: KGEvidence[],
+    causalReasoning?: string
   ): Promise<{
     type: string;
     reason: string;
@@ -1148,12 +1396,18 @@ ${userPerspective}
 - 信息来源：${item.source}
 - 匹配原因：${item.matchReasons?.join('、') || '综合匹配'}
 
+## 证据输入（必须区分关联与因果）
+- KG关联证据：${(kgEvidence || []).filter((k) => k.kind === 'association').map((k) => `${k.relation}(${(k.confidence * 100).toFixed(0)}%)`).join('；') || '无'}
+- KG因果线索：${(kgEvidence || []).filter((k) => k.kind === 'causal_hint').map((k) => `${k.relation}(${(k.confidence * 100).toFixed(0)}%)`).join('；') || '无'}
+- 因果推断证据：${causalReasoning || '无'}
+- 用户画像分层：${userSegment ? JSON.stringify(userSegment) : '未提供'}
+
 ## 信息来源
 ${context.knowledgeContext ? `知识库：${context.knowledgeContext.substring(0, 320)}` : '无知识库信息'}
 ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` : ''}
 
 ## 任务
-用第二人称「您」写推荐理由（50～90 字）：点出**具体需求点**如何被满足；若有检索/知识库依据可一句带过。若只有单条推荐，differentiator 填「本批唯一推荐」或留空字符串。
+用第二人称「您」写推荐理由（50～90 字），并保证可拼装为证据链模板。若只有单条推荐，differentiator 填「本批唯一推荐」或留空字符串。
 
 **输出格式**（JSON）：
 {
@@ -1190,7 +1444,12 @@ ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` 
             : undefined;
         return {
           type: parsed.type || 'feature_similarity',
-          reason: parsed.reason || '基于综合分析推荐',
+          reason: this.formatEvidenceChainReason(
+            parsed.reason || '基于综合分析推荐',
+            this.composeKGEvidenceLineFromItem(kgEvidence),
+            this.composeCausalEvidenceLineFromText(causalReasoning),
+            this.composeUserMatchLine(item.matchReasons, userSegment)
+          ),
           factors: parsed.factors || [],
           weight: 1.0,
           differentiator: diff,
@@ -1203,7 +1462,12 @@ ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` 
     const fallbackReason = this.generateFallbackReason(item, intentResult, context);
     return {
       type: 'feature_similarity',
-      reason: fallbackReason,
+      reason: this.formatEvidenceChainReason(
+        fallbackReason,
+        this.composeKGEvidenceLineFromItem(kgEvidence),
+        this.composeCausalEvidenceLineFromText(causalReasoning),
+        this.composeUserMatchLine(item.matchReasons, userSegment)
+      ),
       factors: item.matchReasons.map((reason, i) => ({
         name: `匹配因素${i + 1}`,
         value: reason,
@@ -1282,6 +1546,70 @@ ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` 
     }).sort((a, b) => b.score - a.score);
   }
 
+  private extractQueryKeywords(query: string, items: Array<{ title: string }>): string[] {
+    const qTokens = query
+      .split(/[\s,，。；;、|/]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+    const titleTokens = items
+      .flatMap((i) => i.title.split(/[\s,，。；;、|/]+/))
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+    return Array.from(new Set([...qTokens, ...titleTokens])).slice(0, 20);
+  }
+
+  /** 仅构建与 query + 候选强相关的局部子图文本，避免全图推理开销 */
+  private buildScopedKGContext(query: string, items: Array<{ title: string }>): string {
+    const keywords = this.extractQueryKeywords(query, items);
+    const lines = [query, ...items.map((it) => it.title)]
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .filter((line) => keywords.some((k) => line.includes(k)))
+      .slice(0, 12);
+    return lines.join('\n');
+  }
+
+  private composeKGEvidenceLine(itemId: string, kgRelations?: Map<string, KGEvidence[]>): string {
+    return this.composeKGEvidenceLineFromItem(kgRelations?.get(itemId));
+  }
+
+  private composeKGEvidenceLineFromItem(kgEvidence?: KGEvidence[]): string {
+    const assoc = (kgEvidence || [])
+      .filter((k) => k.kind === 'association')
+      .slice(0, 2)
+      .map((k) => `${k.relation}(${(k.confidence * 100).toFixed(0)}%)`)
+      .join('；');
+    const causalHints = (kgEvidence || [])
+      .filter((k) => k.kind === 'causal_hint')
+      .slice(0, 2)
+      .map((k) => `${k.relation}(${(k.confidence * 100).toFixed(0)}%)`)
+      .join('；');
+    return `KG证据=关联[${assoc || '无'}] 因果线索[${causalHints || '无'}]`;
+  }
+
+  private composeCausalEvidenceLine(itemId: string, causalChain?: Map<string, string>): string {
+    return this.composeCausalEvidenceLineFromText(causalChain?.get(itemId));
+  }
+
+  private composeCausalEvidenceLineFromText(causalReasoning?: string): string {
+    return `因果证据=${(causalReasoning || '无').slice(0, 120)}`;
+  }
+
+  private composeUserMatchLine(matchReasons?: string[], userSegment?: UserSegmentProfile): string {
+    const reasons = (matchReasons || []).slice(0, 2).join('；') || '综合匹配';
+    const seg = userSegment ? `${userSegment.segment}/${userSegment.experienceLevel}/${userSegment.riskPreference}` : '通用用户';
+    return `用户匹配点=${reasons}（${seg}）`;
+  }
+
+  private formatEvidenceChainReason(
+    baseReason: string,
+    kgEvidenceLine: string,
+    causalEvidenceLine: string,
+    userMatchLine: string
+  ): string {
+    return `【证据链】${kgEvidenceLine} | ${causalEvidenceLine} | ${userMatchLine}\n【推荐说明】${baseReason}`;
+  }
+
   // ============================================================================
   // 辅助方法
   // ============================================================================
@@ -1334,7 +1662,8 @@ ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` 
    */
   private generateOverallExplanation(
     intentResult: any,
-    items: AgentRecommendationItem[]
+    items: AgentRecommendationItem[],
+    userSegment?: UserSegmentProfile
   ): string {
     if (items.length === 0) {
       return '暂无符合您需求的推荐结果。';
@@ -1350,7 +1679,36 @@ ${context.webContext ? `搜索结果：${context.webContext.substring(0, 320)}` 
       'general': '综合推荐',
     }[intentResult.scenarioType] || '综合分析';
 
-    return `基于${scenarioText}场景分析，为您推荐${items.length}个选项。首选"${topItem.title}"，${topItem.explanations[0]?.reason || '综合评估最优'}`;
+    const segmentPart = userSegment
+      ? `面向${userSegment.segment}（${userSegment.experienceLevel}/${userSegment.riskPreference}/${userSegment.timeHorizon}）`
+      : '基于通用用户偏好';
+    return `基于${scenarioText}场景分析，${segmentPart}为您推荐${items.length}个选项。首选"${topItem.title}"，${topItem.explanations[0]?.reason || '综合评估最优'}`;
+  }
+
+  private buildComparisonMetadata(
+    current: { id: string; score: number; source: string; matchReasons?: string[] },
+    allItems: Array<{ id: string; score: number; source: string; matchReasons?: string[] }>
+  ) {
+    const sorted = [...allItems].sort((a, b) => b.score - a.score);
+    const rank = Math.max(1, sorted.findIndex((it) => it.id === current.id) + 1);
+    const topScore = sorted[0]?.score ?? current.score;
+    const scoreGapToTop = Number((topScore - current.score).toFixed(4));
+    const sameSourceAlternatives = allItems.filter((it) => it.id !== current.id && it.source === current.source).length;
+    const currentReasons = new Set((current.matchReasons || []).map((r) => String(r)));
+    const otherReasons = new Set(
+      allItems
+        .filter((it) => it.id !== current.id)
+        .flatMap((it) => it.matchReasons || [])
+        .map((r) => String(r))
+    );
+    const uniqueMatchReasons = Array.from(currentReasons).filter((r) => !otherReasons.has(r)).slice(0, 3);
+
+    return {
+      relativeRank: rank,
+      scoreGapToTop,
+      sameSourceAlternatives,
+      uniqueMatchReasons,
+    };
   }
 
   /**
@@ -1503,11 +1861,12 @@ ${context.knowledgeContext || context.webContext ? `请根据以下信息来源�
         templateContext,
         {
           chat: async (params) => {
+            const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+              { role: 'system', content: '你是一个专业的推荐顾问，请严格按照指定的JSON格式输出。' },
+              ...((params.messages || []) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>),
+            ];
             const response = await this.llmClient.invoke(
-              [
-                { role: 'system', content: '你是一个专业的推荐顾问，请严格按照指定的JSON格式输出。' },
-                ...params.messages,
-              ],
+              messages,
               {
                 model: 'doubao-seed-2-0-pro-260215',
                 temperature: 0.5,

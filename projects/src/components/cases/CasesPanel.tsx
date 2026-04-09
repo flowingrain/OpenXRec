@@ -82,6 +82,16 @@ interface AnalysisCase {
   agent_outputs?: Record<string, any>;
 }
 
+interface CaseRecommendationItem {
+  id?: string;
+  title?: string;
+  description?: string;
+  explanation?: string;
+  score?: number;
+  confidence?: number;
+  source?: string;
+}
+
 interface CaseStats {
   totalCases: number;
   avgRating: number;
@@ -477,6 +487,41 @@ export default function CasesPanel({ isOpen, onClose, onSelectTemplate }: CasesP
           </DialogHeader>
           {selectedCase && (
             <div className="space-y-4">
+              {(() => {
+                const recItems = ((selectedCase.agent_outputs as any)?.recommendationResponse?.items || []) as CaseRecommendationItem[];
+                if (!Array.isArray(recItems) || recItems.length === 0) return null;
+                return (
+                  <div>
+                    <h4 className="text-sm font-medium mb-2">历史推荐内容（来自该案例）</h4>
+                    <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                      {recItems.slice(0, 10).map((rec, idx) => {
+                        const score = typeof rec.score === 'number'
+                          ? rec.score
+                          : (typeof rec.confidence === 'number' ? rec.confidence : 0);
+                        return (
+                          <div key={rec.id || `case-rec-${idx}`} className="rounded-md border bg-muted/20 p-3">
+                            <div className="flex items-center gap-2 mb-1">
+                              <Badge variant="secondary" className="text-[10px]">{idx + 1}</Badge>
+                              <span className="text-sm font-medium truncate">{rec.title || '未命名推荐'}</span>
+                              <span className="ml-auto text-xs text-muted-foreground">{(score * 100).toFixed(0)}%</span>
+                            </div>
+                            {rec.description ? (
+                              <p className="text-xs text-muted-foreground line-clamp-2">{rec.description}</p>
+                            ) : null}
+                            {rec.explanation ? (
+                              <p className="text-xs mt-1 whitespace-pre-wrap break-words">{rec.explanation}</p>
+                            ) : null}
+                            {rec.source ? (
+                              <div className="mt-1 text-[11px] text-muted-foreground">来源：{rec.source}</div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* 基本信息 */}
               <div>
                 <h4 className="text-sm font-medium mb-2">查询内容</h4>

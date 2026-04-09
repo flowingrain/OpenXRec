@@ -40,6 +40,7 @@ import {
   Code,
   Shield,
   ExternalLink,
+  RefreshCw,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AuthButton, useAuth } from '@/components/auth/LoginDialog';
@@ -57,6 +58,8 @@ const KnowledgeGraph = dynamic(() => import('@/components/knowledge/KnowledgeGra
     </div>
   ),
 });
+
+const VECTOR_REUSE_RECOMPUTE_THRESHOLD = 0.94;
 
 // 类型定义
 interface RecommendationItem {
@@ -110,6 +113,13 @@ interface Message {
   };
   // 新增：推荐类型
   recommendationType?: 'comparison' | 'ranking' | 'single' | 'clarification' | 'comparison_analysis';
+  responseMeta?: {
+    cacheHit?: boolean;
+    cacheType?: string;
+    reusedCaseId?: string;
+    similarity?: number;
+    [key: string]: any;
+  };
 }
 
 // 新增：追问问题类型
@@ -268,21 +278,7 @@ export default function OpenXRecHome() {
     setUploadedFiles(prev => prev.filter(f => f.id !== fileId));
   };
 
-  // 发送消息
-  const sendMessage = async () => {
-    if (!input.trim() && uploadedFiles.length === 0) return;
-    
-    const userMessage: Message = {
-      id: `msg_${Date.now()}`,
-      role: 'user',
-      content: input,
-      timestamp: Date.now(),
-    };
-    
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
-    setIsLoading(true);
-
+  const requestRecommendations = async (queryText: string, forceRefresh: boolean = false) => {
     try {
       // 构建请求
       const requestContext = {
@@ -302,9 +298,10 @@ export default function OpenXRecHome() {
           userId: sessionId,
           scenario: 'general',
           context: {
-            query: input,
+            query: queryText,
             ...requestContext,
           },
+          forceRefresh,
           options: {
             topK: 5,
             withExplanation: true,
@@ -327,7 +324,7 @@ export default function OpenXRecHome() {
         };
         setMessages(prev => [...prev, assistantMessage]);
         // 保存原始查询，用于追问回答时恢复上下文
-        setClarificationContext(input);
+        setClarificationContext(queryText);
       } else if (data.success && data.data.items.length > 0) {
         // 获取推荐类型（Agent 返回 queryType=recommendation/single 时与 UI 分支 comparison 对齐，否则气泡内不渲染列表）
         const rawRecType =
@@ -375,6 +372,7 @@ export default function OpenXRecHome() {
             disadvantages: item.disadvantages,
           })),
           explanation: String(data.data.overallExplanation || data.data.explanation || ''),
+          responseMeta: data.data.metadata || {},
         };
         setMessages(prev => [...prev, assistantMessage]);
         
@@ -408,6 +406,32 @@ export default function OpenXRecHome() {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // 发送消息
+  const sendMessage = async () => {
+    if (!input.trim() && uploadedFiles.length === 0) return;
+
+    const queryText = input;
+    const userMessage: Message = {
+      id: `msg_${Date.now()}`,
+      role: 'user',
+      content: queryText,
+      timestamp: Date.now(),
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+    await requestRecommendations(queryText, false);
+  };
+
+  const rerunFullRecommendation = async () => {
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user' && m.content.trim());
+    const queryText = lastUser?.content?.trim();
+    if (!queryText || isLoading) return;
+    setIsLoading(true);
+    await requestRecommendations(queryText, true);
   };
 
   // 发送反馈（专用 /api/recommendation/feedback，勿用 /api/chat-feedback：后者是分析对话上下文用的）
@@ -876,6 +900,31 @@ export default function OpenXRecHome() {
                               {lastRecMessage.recommendations.length} 项
                             </Badge>
                           </div>
+                          {lastRecMessage.responseMeta?.cacheHit && (
+                            <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 flex items-center justify-between gap-3">
+                              <div className="text-xs text-amber-800">
+                                命中{lastRecMessage.responseMeta.cacheType === 'vector_reuse' ? '向量复用' : '短时缓存'}
+                                {typeof lastRecMessage.responseMeta.similarity === 'number'
+                                  ? `（相似度 ${(lastRecMessage.responseMeta.similarity * 100).toFixed(0)}%）`
+                                  : ''}
+                                {lastRecMessage.responseMeta.cacheType === 'vector_reuse' &&
+                                  typeof lastRecMessage.responseMeta.similarity === 'number' &&
+                                  lastRecMessage.responseMeta.similarity < VECTOR_REUSE_RECOMPUTE_THRESHOLD
+                                  ? '，建议完整重算以获取最新结果'
+                                  : ''}
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 text-xs"
+                                onClick={rerunFullRecommendation}
+                                disabled={isLoading}
+                              >
+                                <RefreshCw className="w-3 h-3 mr-1" />
+                                完整重算
+                              </Button>
+                            </div>
+                          )}
                           <div className="space-y-3">
                             {lastRecMessage.recommendations.slice(0, 5).map((rec, index) => {
                               const rankingRec = rec as RankingItem;
@@ -927,14 +976,42 @@ export default function OpenXRecHome() {
                                   {isExpanded && (
                                     <div className="border-t bg-gradient-to-b from-slate-50 to-white">
                                       <CardContent className="pt-4 pb-4">
-                                        {/* 推荐理由 */}
+                                        {/* 推荐理由（证据链分段展示） */}
                                         {rec.explanation && (
                                           <div className="mb-4 p-3 bg-blue-50/50 border border-blue-100 rounded-lg">
                                             <div className="flex items-center gap-2 text-sm font-semibold text-blue-700 mb-2">
                                               <Info className="w-4 h-4" />
                                               推荐理由
                                             </div>
-                                            <p className="text-sm text-slate-700 leading-relaxed">{String(rec.explanation || '')}</p>
+                                            {(() => {
+                                              const text = String(rec.explanation || '');
+                                              const [evidenceRaw, summaryRaw] = text.split('【推荐说明】');
+                                              const evidenceText = evidenceRaw.replace(/^【证据链】/, '').trim();
+                                              const summaryText = (summaryRaw || '').trim();
+                                              const evidenceParts = evidenceText
+                                                .split('|')
+                                                .map((s) => s.trim())
+                                                .filter(Boolean);
+                                              return (
+                                                <div className="space-y-2">
+                                                  {evidenceParts.length > 0 && (
+                                                    <div className="rounded-md border border-blue-100 bg-white/70 p-2">
+                                                      <div className="text-xs font-medium text-blue-700 mb-1">证据链</div>
+                                                      <div className="space-y-1">
+                                                        {evidenceParts.map((part, i) => (
+                                                          <p key={i} className="text-xs text-slate-600 leading-relaxed break-words">
+                                                            {part}
+                                                          </p>
+                                                        ))}
+                                                      </div>
+                                                    </div>
+                                                  )}
+                                                  <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
+                                                    {summaryText || text}
+                                                  </p>
+                                                </div>
+                                              );
+                                            })()}
                                           </div>
                                         )}
 

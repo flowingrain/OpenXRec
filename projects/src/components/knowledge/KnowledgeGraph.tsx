@@ -624,15 +624,73 @@ export default function KnowledgeGraph({
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'update-entity',
-              payload: { id: selectedNode.id, data: { verified: true, source_type: 'expert_verified' } },
+              payload: { id: selectedNode.id, data: { verified: true, source_type: 'manual' } },
             }),
           });
           if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error((err as { error?: string }).error || '确认实体失败');
           }
+        } else {
+          const res = await fetch('/api/knowledge-graph/entities', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'upsert-entity',
+              payload: {
+                id: selectedNode.id,
+                name: selectedNode.name,
+                type: selectedNode.type,
+                description: selectedNode.description || '',
+                aliases: selectedNode.aliases || [],
+                importance: selectedNode.importance ?? 0.5,
+                properties: selectedNode.properties || {},
+                verified: true,
+                source_type: 'manual',
+              },
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error((err as { error?: string }).error || '确认实体失败');
+          }
+          const upsertResult = await res.json().catch(() => ({})) as { data?: { id?: string } };
+          const persistedId = upsertResult?.data?.id;
+          const oldTempId = selectedNode.id;
+          if (persistedId && persistedId !== oldTempId) {
+            setNodes((prev) =>
+              prev.map((n) =>
+                n.id === oldTempId
+                  ? { ...n, id: persistedId, data: { ...n.data, verified: true, source_type: 'manual' } }
+                  : n
+              )
+            );
+            // 实体 ID 替换后，所有关联边端点同步替换，避免后续编辑/确认找不到实体。
+            setEdges((prev) =>
+              prev.map((e) => ({
+                ...e,
+                source: e.source === oldTempId ? persistedId : e.source,
+                target: e.target === oldTempId ? persistedId : e.target,
+                data: {
+                  ...(e.data || {}),
+                  source_entity_id: e.source === oldTempId ? persistedId : (e.data as any)?.source_entity_id,
+                  target_entity_id: e.target === oldTempId ? persistedId : (e.data as any)?.target_entity_id,
+                },
+              }))
+            );
+            setSelectedNode({ ...selectedNode, id: persistedId, verified: true });
+            pushNotice('success', '实体已确认并固化');
+            return;
+          }
         }
         setSelectedNode({ ...selectedNode, verified: true });
+        setNodes((prev) =>
+          prev.map((n) =>
+            n.id === selectedNode.id
+              ? { ...n, data: { ...n.data, verified: true, source_type: 'manual' } }
+              : n
+          )
+        );
         pushNotice('success', '实体已确认');
       } else if (selectedEdge) {
         if (isLikelyPersistedId(selectedEdge.id)) {
@@ -641,15 +699,95 @@ export default function KnowledgeGraph({
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'update-relation',
-              payload: { id: selectedEdge.id, data: { verified: true, source_type: 'expert_verified' } },
+              payload: { id: selectedEdge.id, data: { verified: true, source_type: 'manual' } },
             }),
           });
           if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error((err as { error?: string }).error || '确认关系失败');
           }
+        } else {
+          const sourceEntity = entities.find((e) => e.id === selectedEdge.source_entity_id);
+          const targetEntity = entities.find((e) => e.id === selectedEdge.target_entity_id);
+          const res = await fetch('/api/knowledge-graph/entities', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'upsert-relation',
+              payload: {
+                id: selectedEdge.id,
+                source_entity_id: selectedEdge.source_entity_id,
+                target_entity_id: selectedEdge.target_entity_id,
+                source_name: sourceEntity?.name,
+                target_name: targetEntity?.name,
+                source_type_hint: sourceEntity?.type,
+                target_type_hint: targetEntity?.type,
+                type: selectedEdge.type,
+                confidence: selectedEdge.confidence ?? 0.8,
+                evidence: selectedEdge.evidence || '',
+                properties: selectedEdge.properties || {},
+                verified: true,
+                source_type: 'manual',
+              },
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error((err as { error?: string }).error || '确认关系失败');
+          }
+          const upsertResult = await res.json().catch(() => ({})) as {
+            data?: { id?: string; source_entity_id?: string; target_entity_id?: string };
+          };
+          const persistedRelId = upsertResult?.data?.id;
+          const persistedSourceId = upsertResult?.data?.source_entity_id || selectedEdge.source_entity_id;
+          const persistedTargetId = upsertResult?.data?.target_entity_id || selectedEdge.target_entity_id;
+          const oldTempRelId = selectedEdge.id;
+          if (persistedRelId && persistedRelId !== oldTempRelId) {
+            setEdges((prev) =>
+              prev.map((e) =>
+                e.id === oldTempRelId
+                  ? {
+                      ...e,
+                      id: persistedRelId,
+                      source: persistedSourceId,
+                      target: persistedTargetId,
+                      animated: false,
+                      style: { ...(e.style || {}), strokeWidth: 2.5 },
+                      data: {
+                        ...e.data,
+                        source_entity_id: persistedSourceId,
+                        target_entity_id: persistedTargetId,
+                        verified: true,
+                        source_type: 'manual',
+                      },
+                    }
+                  : e
+              )
+            );
+            setSelectedEdge({
+              ...selectedEdge,
+              id: persistedRelId,
+              source_entity_id: persistedSourceId,
+              target_entity_id: persistedTargetId,
+              verified: true,
+            });
+            pushNotice('success', '关系已确认并固化');
+            return;
+          }
         }
         setSelectedEdge({ ...selectedEdge, verified: true });
+        setEdges((prev) =>
+          prev.map((e) =>
+            e.id === selectedEdge.id
+              ? {
+                  ...e,
+                  animated: false,
+                  style: { ...(e.style || {}), strokeWidth: 2.5 },
+                  data: { ...e.data, verified: true, source_type: 'manual' },
+                }
+              : e
+          )
+        );
         pushNotice('success', '关系已确认');
       }
     } catch (e) {
@@ -658,7 +796,7 @@ export default function KnowledgeGraph({
     } finally {
       setActionBusy(false);
     }
-  }, [actionBusy, selectedNode, selectedEdge, pushNotice]);
+  }, [actionBusy, selectedNode, selectedEdge, pushNotice, entities]);
 
   const handleQuickEditSelected = useCallback(async () => {
     if (actionBusy) return;

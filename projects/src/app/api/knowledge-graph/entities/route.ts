@@ -69,6 +69,10 @@ export async function POST(request: NextRequest) {
         return await handleUpdateEntity(payload);
       case 'update-relation':
         return await handleUpdateRelation(payload);
+      case 'upsert-entity':
+        return await handleUpsertEntity(payload);
+      case 'upsert-relation':
+        return await handleUpsertRelation(payload);
       default:
         return NextResponse.json(
           { error: `Unknown action: ${action}` },
@@ -683,6 +687,7 @@ async function handleUpdateEntity(payload: { id: string; data: any }) {
     .from('kg_entities')
     .update({
       ...data,
+      ...(data?.source_type ? { source_type: normalizeSourceType(data.source_type, 'manual') } : {}),
       updated_at: new Date().toISOString(),
     })
     .eq('id', id);
@@ -709,6 +714,7 @@ async function handleUpdateRelation(payload: { id: string; data: any }) {
     .from('kg_relations')
     .update({
       ...data,
+      ...(data?.source_type ? { source_type: normalizeSourceType(data.source_type, 'manual') } : {}),
       updated_at: new Date().toISOString(),
     })
     .eq('id', id);
@@ -718,4 +724,269 @@ async function handleUpdateRelation(payload: { id: string; data: any }) {
   }
 
   return NextResponse.json({ success: true });
+}
+
+function isUuidLike(id?: string): boolean {
+  return !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+function safeText(input: unknown, maxLen: number, fallback = ''): string {
+  const s = typeof input === 'string' ? input.trim() : '';
+  if (!s) return fallback;
+  return s.slice(0, maxLen);
+}
+
+function safeImportance(input: unknown, fallback = 0.5): number {
+  const n = typeof input === 'number' ? input : Number(input);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < 0) return 0;
+  if (n > 0.99) return 0.99;
+  return Number(n.toFixed(2));
+}
+
+function safeAliases(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return Array.from(
+    new Set(
+      input
+        .map((x) => safeText(x, 255))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+}
+
+function formatDbErrorMessage(prefix: string, error: any): string {
+  const detail = [error?.message, error?.details, error?.hint].filter(Boolean).join(' | ');
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
+function normalizeSourceType(input: unknown, fallback: 'llm' | 'manual' | 'merged' = 'manual'): 'llm' | 'manual' | 'merged' {
+  const raw = safeText(input, 32).toLowerCase();
+  if (!raw) return fallback;
+  if (raw === 'llm' || raw === 'manual' || raw === 'merged') return raw;
+  if (raw === 'expert_verified' || raw === 'expert_merged' || raw === 'import') return 'manual';
+  if (raw.includes('merge')) return 'merged';
+  if (raw.includes('llm') || raw.includes('ai')) return 'llm';
+  return fallback;
+}
+
+async function handleUpsertEntity(payload: {
+  id?: string;
+  name?: string;
+  type?: string;
+  description?: string;
+  aliases?: string[];
+  importance?: number;
+  properties?: Record<string, any>;
+  source_type?: string;
+  verified?: boolean;
+}) {
+  const supabase = getSupabaseClient();
+  const name = safeText(payload.name, 255);
+  if (!name) {
+    return NextResponse.json({ error: 'Entity name is required' }, { status: 400 });
+  }
+
+  const resolvedType = safeText(payload.type, 50, '行业');
+  const safeDescription = safeText(payload.description, 4000);
+  const aliases = safeAliases(payload.aliases);
+  const importance = safeImportance(payload.importance, 0.5);
+  const sourceType = normalizeSourceType(payload.source_type, 'manual');
+  const now = new Date().toISOString();
+
+  // 优先按 ID 命中；其次按同名实体合并
+  let existing: any = null;
+  if (isUuidLike(payload.id)) {
+    const { data } = await supabase.from('kg_entities').select('*').eq('id', payload.id).maybeSingle();
+    existing = data;
+  }
+  if (!existing) {
+    const { data } = await supabase.from('kg_entities').select('*').eq('name', name).maybeSingle();
+    existing = data;
+  }
+
+  if (existing) {
+    const mergedAliases = Array.from(new Set([...(existing.aliases || []), ...aliases]))
+      .map((x) => safeText(x, 255))
+      .filter(Boolean)
+      .slice(0, 20);
+    const mergedProperties = {
+      ...(existing.properties || {}),
+      ...(payload.properties || {}),
+    };
+    const { error } = await supabase
+      .from('kg_entities')
+      .update({
+        type: resolvedType || existing.type,
+        description: safeDescription || existing.description || '',
+        aliases: mergedAliases,
+        importance: Number.isFinite(importance) ? importance : (existing.importance ?? 0.5),
+        properties: mergedProperties,
+        source_type: sourceType || normalizeSourceType(existing.source_type, 'manual'),
+        verified: payload.verified ?? true,
+        updated_at: now,
+      })
+      .eq('id', existing.id);
+    if (error) {
+      return NextResponse.json(
+        { error: formatDbErrorMessage('Failed to upsert entity', error) },
+        { status: 500 }
+      );
+    }
+    return NextResponse.json({ success: true, data: { id: existing.id } });
+  }
+
+  const insertData = {
+    name,
+    type: resolvedType,
+    description: safeDescription,
+    aliases,
+    importance,
+    properties: payload.properties || {},
+    source_type: sourceType,
+    verified: payload.verified ?? true,
+    created_at: now,
+    updated_at: now,
+  };
+  const { data, error } = await supabase.from('kg_entities').insert(insertData).select('id').single();
+  if (error) {
+    return NextResponse.json(
+      { error: formatDbErrorMessage('Failed to insert entity', error) },
+      { status: 500 }
+    );
+  }
+  return NextResponse.json({ success: true, data: { id: data?.id } });
+}
+
+async function ensureEntityIdByHint(hint: {
+  id?: string;
+  name?: string;
+  type?: string;
+}): Promise<string | null> {
+  const supabase = getSupabaseClient();
+  if (isUuidLike(hint.id)) return hint.id!;
+  const name = safeText(hint.name, 255);
+  if (!name) return null;
+
+  const { data: existing } = await supabase
+    .from('kg_entities')
+    .select('id')
+    .eq('name', name)
+    .maybeSingle();
+  if (existing?.id) return existing.id;
+
+  const now = new Date().toISOString();
+  const { data: created, error } = await supabase
+    .from('kg_entities')
+    .insert({
+      name,
+      type: safeText(hint.type, 50, '行业'),
+      aliases: [],
+      description: '',
+      importance: 0.5,
+      properties: {},
+      source_type: 'manual',
+      verified: true,
+      created_at: now,
+      updated_at: now,
+    })
+    .select('id')
+    .single();
+  if (error || !created?.id) return null;
+  return created.id;
+}
+
+async function handleUpsertRelation(payload: {
+  id?: string;
+  source_entity_id?: string;
+  target_entity_id?: string;
+  source_name?: string;
+  target_name?: string;
+  source_type_hint?: string;
+  target_type_hint?: string;
+  type?: string;
+  confidence?: number;
+  evidence?: string;
+  properties?: Record<string, any>;
+  source_type?: string;
+  verified?: boolean;
+}) {
+  const supabase = getSupabaseClient();
+  const relType = (payload.type || '关联').trim() || '关联';
+  const sourceId = await ensureEntityIdByHint({
+    id: payload.source_entity_id,
+    name: payload.source_name,
+    type: payload.source_type_hint,
+  });
+  const targetId = await ensureEntityIdByHint({
+    id: payload.target_entity_id,
+    name: payload.target_name,
+    type: payload.target_type_hint,
+  });
+  if (!sourceId || !targetId) {
+    return NextResponse.json({ error: 'Failed to resolve relation entities' }, { status: 400 });
+  }
+
+  const now = new Date().toISOString();
+  // 同名关系（同源同目标同类型）自动合并
+  const { data: existing } = await supabase
+    .from('kg_relations')
+    .select('*')
+    .eq('source_entity_id', sourceId)
+    .eq('target_entity_id', targetId)
+    .eq('type', relType)
+    .maybeSingle();
+
+  if (existing) {
+    const mergedProperties = {
+      ...(existing.properties || {}),
+      ...(payload.properties || {}),
+    };
+    const { error } = await supabase
+      .from('kg_relations')
+      .update({
+        confidence: payload.confidence ?? existing.confidence ?? 0.8,
+        evidence: payload.evidence ?? existing.evidence ?? '',
+        properties: mergedProperties,
+        source_type: normalizeSourceType(payload.source_type || existing.source_type, 'manual'),
+        verified: payload.verified ?? true,
+        updated_at: now,
+      })
+      .eq('id', existing.id);
+    if (error) return NextResponse.json({ error: 'Failed to upsert relation' }, { status: 500 });
+    return NextResponse.json({
+      success: true,
+      data: {
+        id: existing.id,
+        source_entity_id: sourceId,
+        target_entity_id: targetId,
+      },
+    });
+  }
+
+  const { data, error } = await supabase
+    .from('kg_relations')
+    .insert({
+      source_entity_id: sourceId,
+      target_entity_id: targetId,
+      type: relType,
+      confidence: payload.confidence ?? 0.8,
+      evidence: payload.evidence || '',
+      properties: payload.properties || {},
+      source_type: normalizeSourceType(payload.source_type, 'manual'),
+      verified: payload.verified ?? true,
+      created_at: now,
+      updated_at: now,
+    })
+    .select('id')
+    .single();
+  if (error) return NextResponse.json({ error: 'Failed to insert relation' }, { status: 500 });
+  return NextResponse.json({
+    success: true,
+    data: {
+      id: data?.id,
+      source_entity_id: sourceId,
+      target_entity_id: targetId,
+    },
+  });
 }

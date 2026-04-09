@@ -10,6 +10,9 @@ import type { UserProfile } from '@/lib/recommendation/types';
 import { advancedWebSearch, getWebSearchProvider } from '@/lib/search/advanced-web-search';
 import { createLLMClient } from '@/lib/llm/create-llm-client';
 import type { LLMClient } from 'coze-coding-dev-sdk';
+import { embeddingService } from '@/lib/embedding/service';
+import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { createHash } from 'crypto';
 
 /**
  * 推荐 API：信息充足度评估 + AgentRecommendationService 多智能体推荐
@@ -17,6 +20,8 @@ import type { LLMClient } from 'coze-coding-dev-sdk';
  */
 
 let llmClientInstance: LLMClient | null = null;
+const recommendationCache = new Map<string, { expiresAt: number; data: any }>();
+const RECOMMENDATION_TTL_MS = 5 * 60 * 1000;
 function getLLMClient(): LLMClient {
   if (!llmClientInstance) {
     llmClientInstance = createLLMClient({});
@@ -38,6 +43,56 @@ function extractQueryFromBody(body: Record<string, unknown>): string {
   return '';
 }
 
+function buildCacheKey(query: string, scenario?: string, userId?: string): string {
+  const normalized = `${query.trim().toLowerCase()}|${(scenario || '').trim().toLowerCase()}|${(userId || '').trim().toLowerCase()}`;
+  return createHash('sha256').update(normalized).digest('hex');
+}
+
+function getCachedRecommendation(key: string): any | null {
+  const hit = recommendationCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    recommendationCache.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function setCachedRecommendation(key: string, data: any): void {
+  recommendationCache.set(key, {
+    expiresAt: Date.now() + RECOMMENDATION_TTL_MS,
+    data,
+  });
+}
+
+async function persistRecommendationCase(params: {
+  query: string;
+  scenario?: string;
+  explanation?: string;
+  confidence?: number;
+  responseData: any;
+  source: 'fresh' | 'ttl_cache' | 'vector_reuse';
+  reusedCaseId?: string;
+}) {
+  const supabase = getSupabaseClient();
+  const { error } = await supabase.from('analysis_cases').insert({
+    query: params.query,
+    domain: params.scenario || 'general',
+    conclusion: params.explanation || 'recommendation_result',
+    confidence: Number((params.confidence ?? 0.7).toFixed(2)),
+    agent_outputs: {
+      source: 'recommendation_api',
+      recommendationResponse: params.responseData,
+      generationSource: params.source,
+      reusedCaseId: params.reusedCaseId || null,
+    },
+    status: 'completed',
+  });
+  if (error) {
+    throw new Error(`[analysis_cases insert failed] ${error.message}`);
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -47,6 +102,7 @@ export async function POST(request: NextRequest) {
       sessionContext: bodySessionContext,
       skipSufficiencyCheck,
       userId,
+      forceRefresh,
     } = body;
 
     const query = extractQueryFromBody(body);
@@ -191,6 +247,85 @@ export async function POST(request: NextRequest) {
       typeof sessionContext === 'object' && sessionContext && 'scenario' in sessionContext
         ? String((sessionContext as Record<string, unknown>).scenario)
         : undefined;
+    const cacheKey = buildCacheKey(query, scenario, typeof userId === 'string' ? userId : undefined);
+
+    if (!forceRefresh) {
+      const cached = getCachedRecommendation(cacheKey);
+      if (cached) {
+        const cachedResponseData = {
+          ...cached,
+          metadata: {
+            ...(cached.metadata || {}),
+            cacheHit: true,
+            cacheType: 'ttl',
+            cacheTtlMs: RECOMMENDATION_TTL_MS,
+          },
+        };
+        try {
+          await persistRecommendationCase({
+            query,
+            scenario,
+            explanation: cachedResponseData.explanation,
+            confidence: Number(cachedResponseData?.metadata?.confidence ?? 0.7),
+            responseData: cachedResponseData,
+            source: 'ttl_cache',
+          });
+        } catch (e) {
+          console.warn('[Recommendation API] ttl cache case persistence skipped:', e);
+        }
+        return NextResponse.json({
+          success: true,
+          data: cachedResponseData,
+        });
+      }
+
+      try {
+        const similar = await embeddingService.searchSimilarCases(query, { limit: 1, threshold: 0.92 });
+        const best = similar[0];
+        if (best?.id) {
+          const supabase = getSupabaseClient();
+          const { data: row } = await supabase
+            .from('analysis_cases')
+            .select('id, analyzed_at, agent_outputs')
+            .eq('id', best.id)
+            .maybeSingle();
+          const ageMs = row?.analyzed_at ? Date.now() - new Date(row.analyzed_at).getTime() : Number.MAX_SAFE_INTEGER;
+          const cachedPayload = (row?.agent_outputs as Record<string, any> | undefined)?.recommendationResponse;
+          if (cachedPayload && ageMs <= 30 * 60 * 1000) {
+            setCachedRecommendation(cacheKey, cachedPayload);
+            const reusedResponseData = {
+              ...cachedPayload,
+              metadata: {
+                ...(cachedPayload.metadata || {}),
+                cacheHit: true,
+                cacheType: 'vector_reuse',
+                reusedCaseId: best.id,
+                similarity: best.similarity,
+              },
+            };
+            try {
+              await persistRecommendationCase({
+                query,
+                scenario,
+                explanation: reusedResponseData.explanation,
+                confidence: Number(reusedResponseData?.metadata?.confidence ?? 0.7),
+                responseData: reusedResponseData,
+                source: 'vector_reuse',
+                reusedCaseId: best.id,
+              });
+            } catch (e) {
+              console.warn('[Recommendation API] vector reuse case persistence skipped:', e);
+            }
+            return NextResponse.json({
+              success: true,
+              data: reusedResponseData,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('[Recommendation API] vector reuse skipped:', e);
+      }
+    }
 
     let agentResult: AgentRecommendationResult;
     try {
@@ -300,18 +435,36 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const responseData = {
+      items,
+      recommendations,
+      explanation: agentResult.explanation,
+      overallExplanation: agentResult.explanation,
+      metadata: {
+        ...agentResult.metadata,
+        queryType: agentResult.metadata.queryType,
+        cacheHit: false,
+      },
+    };
+
+    setCachedRecommendation(cacheKey, responseData);
+
+    try {
+      await persistRecommendationCase({
+        query,
+        scenario,
+        explanation: agentResult.explanation,
+        confidence: agentResult.metadata?.confidence ?? 0.7,
+        responseData,
+        source: 'fresh',
+      });
+    } catch (e) {
+      console.warn('[Recommendation API] analysis case persistence skipped:', e);
+    }
+
     return NextResponse.json({
       success: true,
-      data: {
-        items,
-        recommendations,
-        explanation: agentResult.explanation,
-        overallExplanation: agentResult.explanation,
-        metadata: {
-          ...agentResult.metadata,
-          queryType: agentResult.metadata.queryType,
-        },
-      },
+      data: responseData,
     });
   } catch (error: unknown) {
     console.error('[Recommendation API] Error:', error);

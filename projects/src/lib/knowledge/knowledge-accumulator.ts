@@ -119,11 +119,12 @@ export class KnowledgeAccumulator {
       customHeaders?: Record<string, string>;
       autoTag?: boolean;
       extractEntities?: boolean;
+      persistToKnowledge?: boolean;
     } = {}
   ): Promise<KnowledgeExtractionResult> {
     console.log(`[KnowledgeAccumulator] Extracting knowledge from document: ${document.filename}`);
     
-    const { autoTag = true, extractEntities = true } = options;
+    const { autoTag = true, extractEntities = true, persistToKnowledge = true } = options;
     
     // 1. 使用LLM提取知识点
     const extractionPrompt = `你是一个专业知识提取专家。请从以下文档中提取有价值的知识点。
@@ -208,11 +209,12 @@ ${document.content.substring(0, 8000)}
         
         entries.push(entry);
         
-        // 追踪来源
-        this.sourceMap.set(entry.id, 'document_upload');
-        
-        // 添加到知识库
-        await this.knowledgeManager.addKnowledge(entry);
+        if (persistToKnowledge) {
+          // 追踪来源
+          this.sourceMap.set(entry.id, 'document_upload');
+          // 添加到知识库
+          await this.knowledgeManager.addKnowledge(entry);
+        }
       }
       
       console.log(`[KnowledgeAccumulator] Extracted ${entries.length} knowledge entries from document`);
@@ -227,6 +229,19 @@ ${document.content.substring(0, 8000)}
     } catch (error) {
       console.error('[KnowledgeAccumulator] Document extraction failed:', error);
       throw error;
+    }
+  }
+
+  /**
+   * 将已抽取条目写入知识层（用于上传 API 的门禁后入库）。
+   */
+  async persistExtractedEntries(
+    entries: KnowledgeEntry[],
+    source: KnowledgeSource = 'document_upload'
+  ): Promise<void> {
+    for (const entry of entries) {
+      this.sourceMap.set(entry.id, source);
+      await this.knowledgeManager.addKnowledge(entry);
     }
   }
   

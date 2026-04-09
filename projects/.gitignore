@@ -17,8 +17,13 @@ coverage/
 *.lcov
 .nyc_output
 
-# 本地合并的迁移 SQL（pnpm db:sql-bundle），体积大，不提交
-supabase/migrate-all-for-sql-editor.sql
+# 文档：除 README.md 外不提交
+**/*.md
+!README.md
+
+# SQL：除指定迁移汇总文件外不提交
+**/*.sql
+!supabase/migrate-all-for-sql-editor.sql
 
 # Environment variables
 .env
