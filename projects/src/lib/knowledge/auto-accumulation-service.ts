@@ -11,7 +11,8 @@
  * 分析完成 → 案例存储 → 知识提取 → 冲突检测 → （如有冲突）→ 专家确认
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import type { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { vectorStorageService } from '@/lib/embedding/vector-storage-service';
 
@@ -185,7 +186,7 @@ export class KnowledgeAccumulationService {
   private config: AutoAccumulationConfig;
 
   constructor(config: Partial<AutoAccumulationConfig> = {}) {
-    this.llmClient = new LLMClient(new Config());
+    this.llmClient = createLLMClient({});
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 

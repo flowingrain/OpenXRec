@@ -31,4 +31,10 @@ echo "Clearing port ${PORT} before start."
 kill_port_if_listening
 echo "Starting HTTP service on port ${PORT} for dev..."
 
-PORT=$PORT pnpm next dev --port $PORT
+# Next.js 16 默认开发可用 Turbopack；在 Windows 虚拟内存偏小时 SWC 原生模块易失败，进而触发 Turbopack 子进程崩溃。
+# 默认使用 webpack；需要 Turbopack 时：NEXT_DEV_TURBO=1 bash scripts/dev.sh
+if [[ "${NEXT_DEV_TURBO:-}" == "1" ]]; then
+  PORT=$PORT pnpm next dev --port "$PORT" --turbopack
+else
+  PORT=$PORT pnpm next dev --port "$PORT" --webpack
+fi

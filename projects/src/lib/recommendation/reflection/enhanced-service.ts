@@ -7,7 +7,8 @@
  * 3. 反馈循环 → 反思结果驱动优化
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import type { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
 import { 
   ReflectionService, 
   ReflectionResult,
@@ -111,7 +112,7 @@ export class ReflectionEnhancedService {
   
   constructor(llmClient?: LLMClient) {
     // 使用正确的配置创建 LLMClient
-    this.llmClient = llmClient || new LLMClient(new Config());
+    this.llmClient = llmClient ?? createLLMClient({});
     this.reflectionService = new ReflectionService(this.llmClient);
     this.adaptiveOptimizer = new AdaptiveOptimizerAgent(this.llmClient);
   }

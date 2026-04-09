@@ -9,7 +9,8 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import type { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
 import { 
   createRelationTypeManager,
   RelationTypeEntry,
@@ -23,7 +24,7 @@ let relationTypeManager: ReturnType<typeof createRelationTypeManager> | null = n
 function getRelationTypeManager(): ReturnType<typeof createRelationTypeManager> {
   if (!relationTypeManager) {
     if (!llmClient) {
-      llmClient = new LLMClient(new Config());
+      llmClient = createLLMClient({});
     }
     relationTypeManager = createRelationTypeManager(llmClient);
   }

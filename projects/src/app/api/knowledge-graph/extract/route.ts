@@ -5,10 +5,11 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
+import { getChatModelId } from '@/lib/llm/chat-model';
 import type { KGEntity, KGRelation } from '@/lib/knowledge-graph/types';
 
-const llmClient = new LLMClient(new Config());
+const llmClient = createLLMClient({});
 
 interface ExtractRequest {
   query: string;
@@ -78,7 +79,7 @@ ${explanation || '无'}
       { role: 'system', content: '你是一个知识图谱专家，擅长从文本中提取结构化的实体和关系。' },
       { role: 'user', content: prompt },
     ], {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId('doubao-seed-2-0-pro-260215'),
       temperature: 0.3,
     });
 

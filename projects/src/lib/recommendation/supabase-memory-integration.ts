@@ -87,7 +87,27 @@ export class SupabaseRecommendationMemoryManager {
   }
 
   /**
-   * 记录用户反馈
+   * 推荐接口成功返回后的「展示/曝光」统计（服务端写入，非用户在界面点击有用/无用）。
+   * 不写入 user_feedbacks（无关联的 analysis_cases UUID）；仅更新 user_preferences 内行为计数等。
+   */
+  async recordRecommendationImpression(params: {
+    userId: string;
+    /** 本次返回的推荐条数，仅用于日志 */
+    returnedItemCount: number;
+  }): Promise<void> {
+    const { userId, returnedItemCount } = params;
+    await this.updateUserPreferences(userId, {
+      itemId: 'recommendation_session',
+      feedbackType: 'view',
+    });
+    console.log(
+      `[SupabaseRecommendationMemory] 推荐展示事件已记录（服务端统计，非用户显式反馈） userId=${userId} 返回条数=${returnedItemCount}`
+    );
+  }
+
+  /**
+   * 记录用户在界面上的显式反馈（赞/踩/点击等）。
+   * 若 itemId 为分析案例 UUID，会同时写入 user_feedbacks；否则仅更新 user_preferences。
    */
   async recordUserFeedback(feedback: {
     userId: string;
@@ -103,6 +123,10 @@ export class SupabaseRecommendationMemoryManager {
     const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     if (uuidRe.test(itemId)) {
+      const mergedContext =
+        context && typeof context === 'object' && !Array.isArray(context)
+          ? { ...context, userId }
+          : { userId };
       const { error } = await this.supabase
         .from('user_feedbacks')
         .insert({
@@ -110,19 +134,19 @@ export class SupabaseRecommendationMemoryManager {
           feedback_type: feedbackType,
           rating: rating,
           comment: comment,
-          user_context: context,
+          user_context: mergedContext,
         })
         .select()
         .single();
 
       if (error) {
-        console.error('[SupabaseRecommendationMemory] Failed to record feedback:', error);
+        console.error('[SupabaseRecommendationMemory] 写入 user_feedbacks 失败:', error);
         throw error;
       }
     } else {
       console.warn(
-        '[SupabaseRecommendationMemory] Skip user_feedbacks insert (itemId is not a case UUID):',
-        itemId
+        '[SupabaseRecommendationMemory] 未写入 user_feedbacks：itemId 不是分析案例 UUID，仅更新 user_preferences 行为/偏好',
+        { itemId, feedbackType }
       );
     }
 
@@ -133,7 +157,9 @@ export class SupabaseRecommendationMemoryManager {
       rating
     });
 
-    console.log(`[SupabaseRecommendationMemory] Recorded feedback for user ${userId}, item ${itemId}`);
+    console.log(
+      `[SupabaseRecommendationMemory] 用户显式反馈已处理 userId=${userId} itemId=${itemId} type=${feedbackType}`
+    );
   }
 
   /**
@@ -151,7 +177,7 @@ export class SupabaseRecommendationMemoryManager {
     const { data: existingPref } = await this.supabase
       .from('user_preferences')
       .select('*')
-      .eq('userId', userId)
+      .eq('user_id', userId)
       .single();
 
     const preferences = existingPref?.preferences || {
@@ -187,9 +213,9 @@ export class SupabaseRecommendationMemoryManager {
         .from('user_preferences')
         .update({
           preferences: preferences,
-          updatedAt: new Date().toISOString()
+          updated_at: new Date().toISOString()
         })
-        .eq('userId', userId);
+        .eq('user_id', userId);
 
       if (error) {
         console.error('[SupabaseRecommendationMemory] Failed to update preferences:', error);
@@ -198,7 +224,7 @@ export class SupabaseRecommendationMemoryManager {
       const { error } = await this.supabase
         .from('user_preferences')
         .insert({
-          userId: userId,
+          user_id: userId,
           preferences: preferences
         });
 
@@ -215,7 +241,7 @@ export class SupabaseRecommendationMemoryManager {
     const { data, error } = await this.supabase
       .from('user_preferences')
       .select('*')
-      .eq('userId', userId)
+      .eq('user_id', userId)
       .single();
 
     if (error || !data) {
@@ -224,9 +250,9 @@ export class SupabaseRecommendationMemoryManager {
 
     return {
       id: data.id,
-      userId: data.userId,
+      userId: data.user_id,
       preferences: data.preferences,
-      updatedAt: new Date(data.updatedAt).getTime()
+      updatedAt: new Date(data.updated_at).getTime()
     };
   }
 
@@ -240,25 +266,28 @@ export class SupabaseRecommendationMemoryManager {
     const { data, error } = await this.supabase
       .from('user_feedbacks')
       .select('*')
-      .eq('userId', userId)
-      .order('createdAt', { ascending: false })
+      .contains('user_context', { userId })
+      .order('created_at', { ascending: false })
       .limit(limit);
 
     if (error || !data) {
       return [];
     }
 
-    return data.map(item => ({
-      id: item.id,
-      userId: item.userId,
-      caseId: item.caseId,
-      feedbackType: item.feedbackType as any,
-      rating: item.rating,
-      comment: item.comment,
-      aspects: item.aspects,
-      userContext: item.userContext,
-      createdAt: new Date(item.createdAt).getTime()
-    }));
+    return data.map(item => {
+      const ctx = item.user_context as { userId?: string } | null;
+      return {
+        id: item.id,
+        userId: ctx?.userId ?? userId,
+        caseId: item.case_id,
+        feedbackType: item.feedback_type as any,
+        rating: item.rating,
+        comment: item.comment,
+        aspects: item.aspects,
+        userContext: item.user_context,
+        createdAt: new Date(item.created_at).getTime()
+      };
+    });
   }
 
   /**
@@ -317,8 +346,9 @@ export class SupabaseRecommendationMemoryManager {
     await this.supabase
       .from('user_feedbacks')
       .insert({
-        caseId: sessionId,
-        feedbackType: 'session',
+        case_id: sessionId,
+        feedback_type: 'session',
+        user_context: { userId: session.userId },
         comment: JSON.stringify({
           scenario: session.scenario,
           startTime: session.startTime,
@@ -417,9 +447,9 @@ export class SupabaseRecommendationMemoryManager {
     const { data, error } = await this.supabase
       .from('user_feedbacks')
       .select('*')
-      .eq('userId', userId)
-      .eq('feedbackType', 'session')
-      .order('createdAt', { ascending: false })
+      .contains('user_context', { userId })
+      .eq('feedback_type', 'session')
+      .order('created_at', { ascending: false })
       .limit(limit);
 
     if (error || !data) {
@@ -427,7 +457,7 @@ export class SupabaseRecommendationMemoryManager {
     }
 
     return data.map(item => ({
-      sessionId: item.caseId,
+      sessionId: item.case_id,
       ...JSON.parse(item.comment || '{}')
     }));
   }
@@ -482,7 +512,7 @@ export class SupabaseRecommendationMemoryManager {
       .select('*');
 
     if (options.userId) {
-      prefQuery = prefQuery.eq('userId', options.userId);
+      prefQuery = prefQuery.eq('user_id', options.userId);
     }
 
     if (options.limit) {
@@ -499,9 +529,9 @@ export class SupabaseRecommendationMemoryManager {
 
     const preferences: SupabaseUserPreference[] = prefData.map(item => ({
       id: item.id,
-      userId: item.userId,
+      userId: item.user_id,
       preferences: item.preferences || {},
-      updatedAt: new Date(item.updatedAt).getTime()
+      updatedAt: new Date(item.updated_at).getTime()
     }));
 
     // 导出用户反馈
@@ -510,7 +540,7 @@ export class SupabaseRecommendationMemoryManager {
       .select('*');
 
     if (options.userId) {
-      feedbackQuery = feedbackQuery.eq('userId', options.userId);
+      feedbackQuery = feedbackQuery.contains('user_context', { userId: options.userId });
     }
 
     if (options.limit) {
@@ -525,17 +555,20 @@ export class SupabaseRecommendationMemoryManager {
       throw new Error(`导出反馈失败: ${feedbackError.message}`);
     }
 
-    const feedbacks: SupabaseUserFeedback[] = feedbackData.map(item => ({
-      id: item.id,
-      userId: item.userId,
-      caseId: item.caseId,
-      feedbackType: item.feedbackType as any,
-      rating: item.rating,
-      comment: item.comment,
-      aspects: item.aspects,
-      userContext: item.userContext,
-      createdAt: new Date(item.createdAt).getTime()
-    }));
+    const feedbacks: SupabaseUserFeedback[] = feedbackData.map(item => {
+      const ctx = item.user_context as { userId?: string } | null;
+      return {
+        id: item.id,
+        userId: ctx?.userId ?? '',
+        caseId: item.case_id,
+        feedbackType: item.feedback_type as any,
+        rating: item.rating,
+        comment: item.comment,
+        aspects: item.aspects,
+        userContext: item.user_context,
+        createdAt: new Date(item.created_at).getTime()
+      };
+    });
 
     // 导出会话
     const sessions: RecommendationSession[] = options.includeSessions
@@ -592,7 +625,7 @@ export class SupabaseRecommendationMemoryManager {
               const { data: existing } = await this.supabase
                 .from('user_preferences')
                 .select('id')
-                .eq('userId', pref.userId)
+                .eq('user_id', pref.userId)
                 .single();
 
               if (existing) {
@@ -604,7 +637,7 @@ export class SupabaseRecommendationMemoryManager {
                     .from('user_preferences')
                     .update({
                       preferences: pref.preferences,
-                      updatedAt: new Date(pref.updatedAt).toISOString()
+                      updated_at: new Date(pref.updatedAt).toISOString()
                     })
                     .eq('id', pref.id);
 
@@ -623,9 +656,9 @@ export class SupabaseRecommendationMemoryManager {
               .from('user_preferences')
               .insert({
                 id: pref.id,
-                userId: pref.userId,
+                user_id: pref.userId,
                 preferences: pref.preferences,
-                updatedAt: new Date(pref.updatedAt).toISOString()
+                updated_at: new Date(pref.updatedAt).toISOString()
               });
 
             if (insertError) {
@@ -653,14 +686,18 @@ export class SupabaseRecommendationMemoryManager {
               .from('user_feedbacks')
               .insert({
                 id: feedback.id,
-                userId: feedback.userId,
-                caseId: feedback.caseId,
-                feedbackType: feedback.feedbackType,
+                case_id: feedback.caseId,
+                feedback_type: feedback.feedbackType,
                 rating: feedback.rating,
                 comment: feedback.comment,
                 aspects: feedback.aspects,
-                userContext: feedback.userContext,
-                createdAt: new Date(feedback.createdAt).toISOString()
+                user_context: {
+                  ...(feedback.userContext && typeof feedback.userContext === 'object'
+                    ? feedback.userContext
+                    : {}),
+                  userId: feedback.userId,
+                },
+                created_at: new Date(feedback.createdAt).toISOString()
               });
 
             if (insertError) {
@@ -712,7 +749,7 @@ export class SupabaseRecommendationMemoryManager {
       let query = this.supabase.from('user_preferences').delete();
 
       if (options.userId) {
-        query = query.eq('userId', options.userId);
+        query = query.eq('user_id', options.userId);
       }
 
       const { count: prefCount } = await this.supabase
@@ -730,7 +767,7 @@ export class SupabaseRecommendationMemoryManager {
       let query = this.supabase.from('user_feedbacks').delete();
 
       if (options.userId) {
-        query = query.eq('userId', options.userId);
+        query = query.contains('user_context', { userId: options.userId });
       }
 
       const { count: feedbackCount } = await this.supabase

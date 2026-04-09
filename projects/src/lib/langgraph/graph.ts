@@ -29,6 +29,13 @@ import {
 } from './nodes';
 import { LLMClient, HeaderUtils } from 'coze-coding-dev-sdk';
 import { advancedWebSearch } from '@/lib/search/advanced-web-search';
+import {
+  getAnalysisForwardHeaders,
+  setAnalysisForwardHeaders,
+  clearAnalysisForwardHeaders,
+} from './analysis-graph-context';
+import { mergeSchedulingIntoAgentSchedule } from './schedule-merge';
+import { IntelligentScheduler } from './intelligent-scheduler';
 import { getCanonicalAgentId, getAgentDisplayConfig, AGENT_LAYERS } from './agent-config';
 
 /**
@@ -736,9 +743,67 @@ export function createAnalysisGraph() {
   const workflow = new StateGraph(AnalysisState)
     // ========== 调度层 ==========
     .addNode('intent_parser', async (state: AnalysisStateType) => coordinatorNode(state, createLLMClient()))
-    
+
+    /** 意图解析之后：合并 IntelligentScheduler 与协调器编排 */
+    .addNode('scheduler_merge', async (state: AnalysisStateType) => {
+      if (process.env.USE_INTELLIGENT_SCHEDULER === 'false') {
+        return {};
+      }
+      try {
+        const llm = createLLMClient(getAnalysisForwardHeaders());
+        const scheduler = new IntelligentScheduler({
+          llmClient: llm,
+          maxParallelism: 5,
+          enableDynamicScheduling: true,
+          enableEarlyTermination: false,
+        });
+        const decision = await scheduler.analyzeTaskRequirements(state.query, state);
+        const merged = mergeSchedulingIntoAgentSchedule(state.agentSchedule, decision);
+        return { agentSchedule: merged };
+      } catch (e) {
+        console.warn('[AnalysisGraph] scheduler_merge failed:', e);
+        return {};
+      }
+    })
+
     // ========== 感知体层 ==========
-    .addNode('scout_cluster', async (state: AnalysisStateType) => state)  // 搜索在executeAnalysis中处理
+    .addNode('scout_cluster', async (state: AnalysisStateType) => {
+      const query = state.query || '';
+      const customHeaders = getAnalysisForwardHeaders();
+      let rawItems: Array<SearchItem & { relevanceScore: number }> = [];
+      let searchResults = { summary: '', items: [] as SearchItem[] };
+      try {
+        const searchResponse = await advancedWebSearch(
+          query,
+          {
+            count: 20,
+            needSummary: true,
+            needContent: true,
+            timeRange: '1m',
+          },
+          customHeaders
+        );
+        rawItems = (searchResponse.web_items || []).map((item) => ({
+          title: item.title || '',
+          url: item.url || '',
+          snippet: item.snippet || '',
+          content: item.content || '',
+          siteName: item.site_name || '',
+          publishTime: item.publish_time || '',
+          authorityLevel: item.auth_info_level || 0,
+          authorityDesc: item.auth_info_des || '',
+          relevanceScore: calculateRelevanceScore(item, query),
+        })) as (SearchItem & { relevanceScore: number })[];
+        const filteredItems = filterHighQualitySources(rawItems, 10);
+        searchResults = {
+          summary: searchResponse.summary || '',
+          items: filteredItems,
+        };
+      } catch (searchError) {
+        console.error('[AnalysisGraph] scout_cluster search error:', searchError);
+      }
+      return { ...(await searchNode(state, searchResults)) };
+    })
     .addNode('event_extractor', async (state: AnalysisStateType) => eventExtractorNode(state, createLLMClient()))
     .addNode('quality_evaluator', async (state: AnalysisStateType) => sourceEvaluatorNode(state, createLLMClient()))
     .addNode('geo_extractor', async (state: AnalysisStateType) => geoExtractorNode(state, createLLMClient()))
@@ -779,9 +844,9 @@ export function createAnalysisGraph() {
   // ========== 边连接 ==========
   // 入口 → 调度层
   workflow.addEdge(START, 'intent_parser');
-  
-  // 调度层 → 感知体层
-  workflow.addEdge('intent_parser', 'scout_cluster');
+
+  workflow.addEdge('intent_parser', 'scheduler_merge');
+  workflow.addEdge('scheduler_merge', 'scout_cluster');
   
   // 感知体层：scout_cluster → event_extractor
   workflow.addConditionalEdges(
@@ -1022,6 +1087,94 @@ export function createAnalysisGraph() {
   return workflow.compile();
 }
 
+let compiledAnalysisSingleton: ReturnType<typeof createAnalysisGraph> | null = null;
+
+export function getCompiledAnalysisGraph() {
+  if (!compiledAnalysisSingleton) {
+    compiledAnalysisSingleton = createAnalysisGraph();
+  }
+  return compiledAnalysisSingleton;
+}
+
+/**
+ * 使用 compile 后的 LangGraph 单次 invoke（默认路径）。
+ * 设置 USE_LEGACY_ANALYSIS_LOOP=true 可回退到手写循环。
+ */
+async function executeAnalysisCompiled(
+  query: string,
+  customHeaders: Record<string, string>,
+  callbacks: GraphCallbacks
+) {
+  setAnalysisForwardHeaders(customHeaders);
+  try {
+    callbacks.onSystem?.('📊 使用 compile 分析图执行工作流…');
+    const app = getCompiledAnalysisGraph();
+    const initial: Partial<AnalysisStateType> = {
+      query,
+      messages: [],
+      searchResults: [],
+      searchSummary: '',
+      timeline: [],
+      causalChain: [],
+      keyFactors: [],
+      scenarios: [],
+      completedAgents: [],
+      iterationCount: 0,
+      maxIterations: 3,
+      qualityIssues: [],
+      revisionHistory: [],
+      needsRevision: false,
+      revisionTarget: '',
+      revisionReason: '',
+    };
+    const finalState = (await app.invoke(initial as AnalysisStateType, {
+      recursionLimit: 100,
+    })) as Partial<AnalysisStateType>;
+
+    if (finalState.agentSchedule) {
+      callbacks.onAgentSchedule?.(finalState.agentSchedule);
+    }
+
+    const eventGraph = generateEventGraph(finalState);
+    callbacks.onEventGraph?.(eventGraph);
+
+    const finalReport = generateFinalReport(finalState);
+
+    const avgScenarioProb =
+      (finalState.scenarios || []).length > 0
+        ? (finalState.scenarios || []).reduce(
+            (sum: number, s: any) => sum + (s.probability || 0.33),
+            0
+          ) / (finalState.scenarios || []).length
+        : 0.5;
+    const searchCount = (finalState.searchResults || []).length;
+    const sourceBonus = Math.min(searchCount * 0.02, 0.1);
+    const confidence = Math.min(
+      0.95,
+      avgScenarioProb * 0.5 + 0.4 + sourceBonus
+    );
+
+    return {
+      searchResults: finalState.searchResults || [],
+      timeline: finalState.timeline || [],
+      causalChain: finalState.causalChain || [],
+      keyFactors: finalState.keyFactors || [],
+      scenarios: finalState.scenarios || [],
+      eventGraph,
+      knowledgeGraph: finalState.knowledgeGraph || null,
+      finalReport,
+      taskComplexity: finalState.taskComplexity || 'moderate',
+      agentSchedule: finalState.agentSchedule || null,
+      skippedAgents: [] as string[],
+      iterationCount: finalState.iterationCount || 0,
+      revisionHistory: finalState.revisionHistory || [],
+      confidence,
+    };
+  } finally {
+    clearAnalysisForwardHeaders();
+  }
+}
+
 /**
  * 执行分析工作流（带回调、条件跳过和循环修正）
  */
@@ -1048,6 +1201,10 @@ export async function executeAnalysis(
   revisionHistory: any[];
   confidence: number;
 }> {
+  if (process.env.USE_LEGACY_ANALYSIS_LOOP !== 'true') {
+    return executeAnalysisCompiled(query, customHeaders, callbacks);
+  }
+
   const llmClient = createLLMClient(customHeaders);
 
   let state: Partial<AnalysisStateType> = {

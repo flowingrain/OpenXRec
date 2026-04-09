@@ -7,13 +7,13 @@
  * 3. 通过解释生成智能体生成有依据的推荐理由
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import type { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
 import {
   RecommendationState,
-  buildRecommendationGraph,
   intentAnalyzerNode,
   explanationGeneratorNode,
-} from './agents';
+} from './agents-nodes';
 import type { ExplanationFactor, RecommendationItem, RecommendationContext } from './types';
 import {
   getTemplateSelector,
@@ -81,6 +81,8 @@ export interface AgentServiceConfig {
   useFullPipeline?: boolean;  // 是否使用完整智能体管道
   skipKnowledgeGraph?: boolean;  // 跳过知识图谱构建（用于简单查询）
   maxAgentsParallel?: number;  // 最大并行智能体数
+  /** 最终返回条数上限（默认 5，API 可传入与 RECOMMENDATION_MAX_ITEMS 对齐） */
+  maxReturnItems?: number;
 }
 
 // ============================================================================
@@ -98,7 +100,7 @@ export class AgentRecommendationService {
   private templateSelector: ReturnType<typeof getTemplateSelector>;
 
   constructor(llmClient?: LLMClient, config?: AgentServiceConfig) {
-    this.llmClient = llmClient || new LLMClient(new Config());
+    this.llmClient = llmClient ?? createLLMClient({});
     this.config = config || {};
     this.templateSelector = getTemplateSelector({ enableDebug: true });
   }
@@ -243,8 +245,13 @@ export class AgentRecommendationService {
         ? optimizedItems.reduce((sum, item) => sum + item.confidence, 0) / optimizedItems.length
         : 0.7;
 
+      const maxItems = Math.min(
+        20,
+        Math.max(1, this.config.maxReturnItems ?? 5)
+      );
+
       return {
-        items: optimizedItems.slice(0, 5),
+        items: optimizedItems.slice(0, maxItems),
         strategy: this.determineStrategy(context.sources),
         explanation: this.generateOverallExplanation(intentResult, optimizedItems),
         metadata: {

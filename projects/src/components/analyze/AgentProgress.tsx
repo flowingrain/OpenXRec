@@ -28,7 +28,7 @@ import {
   ChevronDown,
   ChevronUp
 } from 'lucide-react';
-import { AnalysisState, agentNameMap, layerColorMap, layerBgMap } from '@/types';
+import { AnalysisState, agentNameMap, layerColorMap, layerBgMap } from '@/app/types';
 import { useState } from 'react';
 
 interface AgentProgressProps {

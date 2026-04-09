@@ -7,7 +7,7 @@
  * 3. 综合排序展示
  */
 
-import { LLMClient } from 'coze-coding-dev-sdk';
+import type { LLMClient } from 'coze-coding-dev-sdk';
 
 // ============================================================================
 // 类型定义
@@ -255,6 +255,22 @@ export class RecommendationTypeDetector {
 // ============================================================================
 
 /**
+ * 将 API 传入的 sessionContext（对象或字符串）规范为字符串，供领域识别与历史提取使用。
+ */
+export function normalizeSessionContextForSufficiency(sessionContext?: unknown): string | undefined {
+  if (sessionContext == null || sessionContext === '') return undefined;
+  if (typeof sessionContext === 'string') return sessionContext;
+  if (typeof sessionContext === 'object') {
+    try {
+      return JSON.stringify(sessionContext).slice(0, 8000);
+    } catch {
+      return String(sessionContext);
+    }
+  }
+  return String(sessionContext);
+}
+
+/**
  * 信息充足性评估器
  * 
  * 评估用户输入信息是否足够给出高质量推荐
@@ -385,18 +401,20 @@ export class InformationSufficiencyEvaluator {
   /**
    * 评估信息充足性
    * @param query 当前查询
-   * @param sessionContext 会话历史上下文（可选）
+   * @param sessionContext 会话历史上下文（可选，字符串或对象）
    */
-  async evaluate(query: string, sessionContext?: string): Promise<InformationSufficiency> {
+  async evaluate(query: string, sessionContext?: unknown): Promise<InformationSufficiency> {
+    const ctxStr = normalizeSessionContextForSufficiency(sessionContext);
+
     // 1. 识别领域（传入会话上下文以处理追问场景）
-    const domain = await this.detectDomain(query, sessionContext);
+    const domain = await this.detectDomain(query, ctxStr);
     
     // 2. 提取已有信息（包括历史上下文）
     const extractedInfo = await this.extractInformation(query);
     
     // 2.1 如果有历史上下文，也从中提取信息
-    if (sessionContext) {
-      const historyInfo = await this.extractInformation(sessionContext);
+    if (ctxStr) {
+      const historyInfo = await this.extractInformation(ctxStr);
       // 合并并去重
       extractedInfo.push(...historyInfo.filter(info => !extractedInfo.includes(info)));
       console.log(`[SufficiencyEvaluator] Extracted from history: ${historyInfo.length}, total: ${extractedInfo.length}`);
@@ -435,7 +453,7 @@ export class InformationSufficiencyEvaluator {
       missingRequired, 
       missingOptional,
       extractedInfo,
-      sessionContext
+      ctxStr
     );
 
     return {
@@ -580,7 +598,7 @@ export class InformationSufficiencyEvaluator {
     // 构建上下文感知的 prompt
     const contextPrompt = sessionContext 
       ? `用户历史对话：
-${sessionContext.substring(0, 500)}
+${(typeof sessionContext === 'string' ? sessionContext : String(sessionContext)).slice(0, 500)}
 
 当前用户输入：${query}
 

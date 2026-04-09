@@ -35,9 +35,9 @@ export {
   kgReasonerNode,
   diversityOptimizerNode,
   noveltyDetectorNode,
-  buildRecommendationGraph,
-  recommendationGraph
-} from './agents';
+} from './agents-nodes';
+
+export { buildRecommendationGraph, recommendationGraph, RecommendationStateAnnotation } from './agents-graph';
 
 // ============================================================================
 // 智能体推荐服务

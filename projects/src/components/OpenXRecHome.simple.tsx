@@ -77,7 +77,7 @@ export default function OpenXRecHome() {
 
       const data = await response.json();
       
-      if (data.success && data.data.items) {
+      if (data.success && Array.isArray(data.data.items) && data.data.items.length > 0) {
         const assistantMessage = {
           id: `msg_${Date.now() + 1}`,
           role: 'assistant',
@@ -237,6 +237,27 @@ export default function OpenXRecHome() {
                           )}
                         >
                           <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                          {message.role === 'assistant' &&
+                            Array.isArray(message.recommendations) &&
+                            message.recommendations.length > 0 && (
+                              <ul className="mt-3 space-y-2 text-left border-t border-border/60 pt-3">
+                                {message.recommendations.map((rec: any) => (
+                                  <li
+                                    key={rec.id || rec.title}
+                                    className="rounded-md border bg-background/80 p-2 text-xs"
+                                  >
+                                    <div className="font-medium text-foreground">
+                                      {String(rec.title || '未命名')}
+                                    </div>
+                                    {rec.description ? (
+                                      <p className="mt-1 text-muted-foreground line-clamp-3">
+                                        {String(rec.description)}
+                                      </p>
+                                    ) : null}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
                         </div>
                       </div>
                     ))}

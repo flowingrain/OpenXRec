@@ -273,7 +273,7 @@ async function handleRecordBehavior(
 }
 
 /**
- * 处理记录用户反馈
+ * 处理用户在资料/设置侧提交的显式反馈（与推荐接口内的「展示统计」不同）。
  */
 async function handleRecordFeedback(
   userId: string,

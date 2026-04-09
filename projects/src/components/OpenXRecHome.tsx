@@ -326,8 +326,13 @@ export default function OpenXRecHome() {
         // 保存原始查询，用于追问回答时恢复上下文
         setClarificationContext(input);
       } else if (data.success && data.data.items.length > 0) {
-        // 获取推荐类型
-        const recommendationType = data.data.metadata?.queryType || data.data.metadata?.recommendationType || 'comparison';
+        // 获取推荐类型（Agent 返回 queryType=recommendation/single 时与 UI 分支 comparison 对齐，否则气泡内不渲染列表）
+        const rawRecType =
+          data.data.metadata?.queryType || data.data.metadata?.recommendationType || 'comparison';
+        const recommendationType: Message['recommendationType'] =
+          rawRecType === 'recommendation' || rawRecType === 'single'
+            ? 'comparison'
+            : (rawRecType as Message['recommendationType']);
         const isRanking = recommendationType === 'ranking';
         const isComparisonAnalysis = recommendationType === 'comparison_analysis';
         
@@ -742,7 +747,7 @@ export default function OpenXRecHome() {
                                                       )}
                                                       onClick={() => handleSelectAnswer(q.id, opt)}
                                                     >
-                                                      {opt}
+                                                      {String(opt)}
                                                     </Button>
                                                   );
                                                 })}

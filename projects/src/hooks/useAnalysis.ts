@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useMemo } from 'react';
-import { AnalysisState } from '@/types';
+import { AnalysisState } from '@/app/types';
 
 // 跳过决策类型
 export interface SkipDecision {

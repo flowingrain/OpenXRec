@@ -1528,6 +1528,7 @@ src/
 - **项目理解加速**：初始可以依赖项目下 `package.json` 文件理解项目类型
 - **Hydration 错误预防**：严禁在 JSX 渲染逻辑中直接使用 `typeof window`、`Date.now()`、`Math.random()` 等动态数据
 - **UI 设计规范**：采用 shadcn/ui 组件、风格和规范
+- **后台新功能语言偏好**：后续新增**后台能力**（独立服务、批处理、训练/推理管线、重型算法、数据科学脚本等）时，**优先使用 Python** 实现；Next.js `app/api` 保留为 BFF、鉴权、聚合与轻量编排，通过 HTTP/gRPC 等调用 Python 服务。现有 TypeScript 模块若无迁移必要可继续维护，避免无谓重写。
 
 ## 用户满意度度量与升级闭环系统
 
