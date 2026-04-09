@@ -181,11 +181,12 @@ export class KnowledgeGraphService {
     
     try {
       // 使用 invoke 方法调用 LLM
+      const { getChatModelId } = await import('@/lib/llm/chat-model');
       const response = await llmClient.invoke([{
         role: 'user',
         content: prompt
       }], {
-        model: 'doubao-seed-2-0-pro-260215',
+        model: getChatModelId(),
         temperature: 0.3  // 低温度以确保输出格式稳定
       });
       

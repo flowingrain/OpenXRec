@@ -3,18 +3,13 @@
  * 每个节点是一个函数，接收状态，返回状态更新
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import { LLMClient } from 'coze-coding-dev-sdk';
 import { AnalysisStateType, SearchItem, TimelineEvent, CausalChainNode, KeyFactor, ScenarioNode, TaskComplexity, AgentSchedule, FallbackStrategy, AgentError, DEFAULT_FALLBACK_STRATEGIES } from './state';
 import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import { KnowledgeGraphService } from '../knowledge-graph/service';
+import { getChatModelId } from '@/lib/llm/chat-model';
 
-/**
- * 创建 LLM 客户端
- */
-export function createLLMClient(customHeaders?: Record<string, string>): LLMClient {
-  const config = new Config();
-  return new LLMClient(config, customHeaders);
-}
+export { createLLMClient } from '@/lib/llm/create-llm-client';
 
 /**
  * 调用 LLM 进行对话（带重试）
@@ -34,7 +29,7 @@ async function llmChat(
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const response = await llmClient.invoke(sdkMessages, {
-        model: 'doubao-seed-2-0-pro-260215',
+        model: getChatModelId(),
         temperature: 0.7
       });
       
@@ -244,7 +239,7 @@ ${text.substring(0, 2000)}
       { role: 'system', content: '你是JSON解析专家，只输出JSON，不输出其他内容。' },
       { role: 'user', content: semanticPrompt }
     ], {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(),
       temperature: 0.1  // 低温度保证一致性
     });
     
@@ -2101,7 +2096,7 @@ ${item.snippet}
       { role: 'system', content: '你是事件抽取专家，擅长从非结构化文本中识别和抽取结构化事件信息。' },
       { role: 'user', content: prompt }
     ], {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(),
       temperature: 0.3
     });
     
@@ -2184,7 +2179,7 @@ ${keyFactors.map((f, i) => `${i + 1}. ${f.factor} (影响度: ${f.impact || '未
       { role: 'system', content: '你是分析验证专家，擅长发现推理中的逻辑漏洞和不一致之处。' },
       { role: 'user', content: prompt }
     ], {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(),
       temperature: 0.3
     });
     

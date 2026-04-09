@@ -152,12 +152,12 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 2. 添加向量列
 ALTER TABLE knowledge_docs 
-ADD COLUMN IF NOT EXISTS embedding vector(1024),
+ADD COLUMN IF NOT EXISTS embedding vector(2000),
 ADD COLUMN IF NOT EXISTS embedding_model varchar(100),
 ADD COLUMN IF NOT EXISTS embedding_generated_at timestamp with time zone;
 
 ALTER TABLE kg_entities 
-ADD COLUMN IF NOT EXISTS embedding vector(1024),
+ADD COLUMN IF NOT EXISTS embedding vector(2000),
 ADD COLUMN IF NOT EXISTS embedding_model varchar(100),
 ADD COLUMN IF NOT EXISTS embedding_generated_at timestamp with time zone;
 

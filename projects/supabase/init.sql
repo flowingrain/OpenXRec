@@ -3,6 +3,9 @@
 -- 执行方式: 在 Supabase SQL Editor 中运行此脚本
 -- ============================================================================
 
+-- pgvector：必须先创建，后续表中的 vector(…) 列才能建成功
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- ============================================================================
 -- 1. 知识图谱实体表
 -- ============================================================================
@@ -114,6 +117,21 @@ CREATE TABLE IF NOT EXISTS analysis_cases (
 CREATE INDEX IF NOT EXISTS idx_analysis_cases_topic ON analysis_cases(topic);
 CREATE INDEX IF NOT EXISTS idx_analysis_cases_created ON analysis_cases(created_at DESC);
 
+-- 案例向量（语义检索；pgvector，与 migrations 中 HNSW 一致）
+CREATE TABLE IF NOT EXISTS case_embeddings (
+  id VARCHAR(36) PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+  case_id UUID NOT NULL REFERENCES analysis_cases(id) ON DELETE CASCADE,
+  embedding_type VARCHAR(30) NOT NULL,
+  embedding vector(2000) NOT NULL,
+  model VARCHAR(100) NOT NULL DEFAULT 'unknown',
+  text_preview TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS case_embeddings_case_id_idx ON case_embeddings(case_id);
+CREATE INDEX IF NOT EXISTS case_embeddings_model_idx ON case_embeddings(model);
+CREATE INDEX IF NOT EXISTS case_embeddings_type_idx ON case_embeddings(embedding_type);
+
 -- ============================================================================
 -- 6. 案例反馈表
 -- ============================================================================
@@ -128,6 +146,24 @@ CREATE TABLE IF NOT EXISTS case_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_case_feedback_case ON case_feedback(case_id);
 
+-- 用户反馈（聊天面板、进化模块等；与 Drizzle user_feedbacks 一致）
+CREATE TABLE IF NOT EXISTS user_feedbacks (
+  id VARCHAR(36) PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+  case_id UUID NOT NULL REFERENCES analysis_cases(id) ON DELETE CASCADE,
+  feedback_type VARCHAR(30) NOT NULL,
+  rating INTEGER,
+  comment TEXT,
+  correction TEXT,
+  aspects JSONB,
+  user_context JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS user_feedbacks_case_id_idx ON user_feedbacks(case_id);
+CREATE INDEX IF NOT EXISTS user_feedbacks_created_at_idx ON user_feedbacks(created_at DESC);
+CREATE INDEX IF NOT EXISTS user_feedbacks_feedback_type_idx ON user_feedbacks(feedback_type);
+CREATE INDEX IF NOT EXISTS user_feedbacks_case_created_idx ON user_feedbacks(case_id, created_at DESC);
+
 -- ============================================================================
 -- 7. 知识库文档表
 -- ============================================================================
@@ -138,7 +174,7 @@ CREATE TABLE IF NOT EXISTS knowledge_docs (
   file_url TEXT,
   file_type TEXT,
   file_size INTEGER,
-  embedding vector(2048),  -- 需要启用 pgvector 扩展
+  embedding vector(2000),  -- pgvector 索引上限 2000 维；需启用 vector 扩展
   metadata JSONB DEFAULT '{}',
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -177,12 +213,6 @@ CREATE INDEX IF NOT EXISTS idx_report_versions_case ON report_versions(case_id);
 CREATE INDEX IF NOT EXISTS idx_report_versions_created ON report_versions(created_at DESC);
 
 -- ============================================================================
--- 10. 启用必要的扩展
--- ============================================================================
--- 如果需要向量搜索，取消下面的注释
--- CREATE EXTENSION IF NOT EXISTS vector;
-
--- ============================================================================
 -- 10. 行级安全策略 (RLS)
 -- ============================================================================
 ALTER TABLE kg_entities ENABLE ROW LEVEL SECURITY;
@@ -190,7 +220,9 @@ ALTER TABLE kg_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kg_corrections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kg_snapshots ENABLE ROW LEVEL SECURITY;
 ALTER TABLE analysis_cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE case_embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_feedback ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_feedbacks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE knowledge_docs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_preferences ENABLE ROW LEVEL SECURITY;
 ALTER TABLE report_versions ENABLE ROW LEVEL SECURITY;
@@ -206,8 +238,12 @@ CREATE POLICY "Allow anonymous read" ON kg_snapshots FOR SELECT USING (true);
 CREATE POLICY "Allow anonymous write" ON kg_snapshots FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow anonymous read" ON analysis_cases FOR SELECT USING (true);
 CREATE POLICY "Allow anonymous write" ON analysis_cases FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anonymous read" ON case_embeddings FOR SELECT USING (true);
+CREATE POLICY "Allow anonymous write" ON case_embeddings FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow anonymous read" ON case_feedback FOR SELECT USING (true);
 CREATE POLICY "Allow anonymous write" ON case_feedback FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anonymous read" ON user_feedbacks FOR SELECT USING (true);
+CREATE POLICY "Allow anonymous write" ON user_feedbacks FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow anonymous read" ON knowledge_docs FOR SELECT USING (true);
 CREATE POLICY "Allow anonymous write" ON knowledge_docs FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow anonymous read" ON user_preferences FOR SELECT USING (true);
@@ -258,6 +294,8 @@ ON CONFLICT DO NOTHING;
 -- 3. kg_corrections - 修正历史
 -- 4. kg_snapshots - 图谱快照
 -- 5. analysis_cases - 分析案例
--- 6. case_feedback - 案例反馈
--- 7. knowledge_docs - 知识库文档
--- 8. user_preferences - 用户偏好
+-- 6. case_embeddings - 案例向量（语义检索）
+-- 7. case_feedback - 案例反馈
+-- 8. user_feedbacks - 用户反馈
+-- 9. knowledge_docs - 知识库文档
+-- 10. user_preferences - 用户偏好

@@ -116,7 +116,7 @@ interface EmbeddingStats {
 export class EmbeddingService {
   private client: EmbeddingClient;
   private embeddingModel = 'doubao-embedding-vision-251215';
-  private embeddingDimensions = 2048;
+  private embeddingDimensions = 2000;
 
   constructor() {
     this.client = new EmbeddingClient();

@@ -7,7 +7,9 @@
  * - 智能体调用优化机制来完成持续进化
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient as createUnifiedLLMClient } from '@/lib/llm/create-llm-client';
+import { getChatModelId } from '@/lib/llm/chat-model';
 import { AnalysisStateType, AgentLayer } from './state';
 import { 
   CaseMemoryStore, 
@@ -61,8 +63,7 @@ export interface EvolutionLayerOutput {
 // ============================================================================
 
 function createLLMClient(): LLMClient {
-  const config = new Config();
-  return new LLMClient(config);
+  return createUnifiedLLMClient();
 }
 
 async function llmChat(
@@ -77,7 +78,7 @@ async function llmChat(
   
   try {
     const response = await llmClient.invoke(sdkMessages, {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(),
       temperature: options?.temperature ?? 0.7
     });
     

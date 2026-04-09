@@ -8,15 +8,27 @@ interface SupabaseCredentials {
   anonKey: string;
 }
 
+function hasSupabaseEnvPair(): boolean {
+  const url =
+    process.env.COZE_SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL;
+  const key =
+    process.env.COZE_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY;
+  return Boolean(url && key);
+}
+
 function loadEnv(): void {
-  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)) {
+  if (envLoaded || hasSupabaseEnvPair()) {
     return;
   }
 
   try {
     try {
       require('dotenv').config();
-      if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
+      if (hasSupabaseEnvPair()) {
         envLoaded = true;
         return;
       }
@@ -70,14 +82,24 @@ except Exception as e:
 function getSupabaseCredentials(): SupabaseCredentials {
   loadEnv();
 
-  const url = process.env.COZE_SUPABASE_URL;
-  const anonKey = process.env.COZE_SUPABASE_ANON_KEY;
+  const url =
+    process.env.COZE_SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL;
+  const anonKey =
+    process.env.COZE_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY;
 
   if (!url) {
-    throw new Error('COZE_SUPABASE_URL is not set');
+    throw new Error(
+      'Supabase URL is not set (use COZE_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_URL, or SUPABASE_URL)'
+    );
   }
   if (!anonKey) {
-    throw new Error('COZE_SUPABASE_ANON_KEY is not set');
+    throw new Error(
+      'Supabase anon/publishable key is not set (use COZE_SUPABASE_ANON_KEY, NEXT_PUBLIC_SUPABASE_ANON_KEY, or SUPABASE_ANON_KEY)'
+    );
   }
 
   return { url, anonKey };

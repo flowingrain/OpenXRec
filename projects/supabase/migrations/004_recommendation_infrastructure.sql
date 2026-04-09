@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS recommendation_knowledge (
   last_accessed_at TIMESTAMPTZ,
 
   -- 向量嵌入（语义搜索）
-  embedding vector(2048),
+  embedding vector(2000),
   embedding_model TEXT,
   embedding_generated_at TIMESTAMPTZ,
 
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS recommendation_items (
   expires_at TIMESTAMPTZ,
 
   -- 向量嵌入（内容相似度）
-  content_embedding vector(2048),
+  content_embedding vector(2000),
   embedding_model TEXT,
   embedding_updated_at TIMESTAMPTZ,
 
@@ -146,12 +146,12 @@ CREATE TABLE IF NOT EXISTS recommendation_embeddings (
   target_id UUID NOT NULL,  -- 关联的对象ID（用户ID、物品ID等）
 
   -- 向量数据
-  embedding vector(2048) NOT NULL,
+  embedding vector(2000) NOT NULL,
 
   -- 向量模型信息
   model_name TEXT NOT NULL,
   model_version TEXT,
-  embedding_dim INTEGER DEFAULT 2048,
+  embedding_dim INTEGER DEFAULT 2000,
 
   -- 向量更新信息
   update_frequency INTEGER DEFAULT 0,
@@ -410,7 +410,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 8.1 知识库语义搜索
 CREATE OR REPLACE FUNCTION search_recommendation_knowledge(
-  query_embedding vector(2048),
+  query_embedding vector(2000),
   match_threshold REAL DEFAULT 0.5,
   match_count INTEGER DEFAULT 10,
   filter_knowledge_type TEXT DEFAULT NULL,
@@ -449,7 +449,7 @@ $$;
 
 -- 8.2 推荐对象相似度搜索
 CREATE OR REPLACE FUNCTION search_similar_items(
-  query_embedding vector(2048),
+  query_embedding vector(2000),
   match_threshold REAL DEFAULT 0.6,
   match_count INTEGER DEFAULT 20,
   filter_item_type TEXT DEFAULT NULL,
@@ -494,7 +494,7 @@ $$;
 
 -- 8.3 用户相似度搜索（基于用户向量）
 CREATE OR REPLACE FUNCTION find_similar_users(
-  target_user_embedding vector(2048),
+  target_user_embedding vector(2000),
   match_threshold REAL DEFAULT 0.6,
   match_count INTEGER DEFAULT 20
 )
@@ -523,7 +523,7 @@ $$;
 
 -- 8.4 物品相似度搜索（基于物品向量）
 CREATE OR REPLACE FUNCTION find_similar_items_by_embedding(
-  target_item_embedding vector(2048),
+  target_item_embedding vector(2000),
   match_threshold REAL DEFAULT 0.6,
   match_count INTEGER DEFAULT 20
 )
@@ -557,7 +557,7 @@ $$;
 -- 9.1 更新知识库嵌入
 CREATE OR REPLACE FUNCTION update_recommendation_knowledge_embedding(
   knowledge_id UUID,
-  new_embedding vector(2048),
+  new_embedding vector(2000),
   model_name TEXT DEFAULT 'doubao-embedding-vision-251215'
 )
 RETURNS BOOLEAN
@@ -579,7 +579,7 @@ $$;
 -- 9.2 更新推荐对象嵌入
 CREATE OR REPLACE FUNCTION update_recommendation_item_embedding(
   item_id UUID,
-  new_embedding vector(2048),
+  new_embedding vector(2000),
   model_name TEXT DEFAULT 'doubao-embedding-vision-251215'
 )
 RETURNS BOOLEAN
@@ -601,7 +601,7 @@ $$;
 -- 9.3 批量更新用户向量
 CREATE OR REPLACE FUNCTION upsert_user_embedding(
   user_id UUID,
-  user_embedding vector(2048),
+  user_embedding vector(2000),
   model_name TEXT DEFAULT 'doubao-embedding-vision-251215',
   update_reason TEXT DEFAULT 'behavior_update'
 )
@@ -764,8 +764,8 @@ SELECT
   rs.avg_conversion_rate,
   COUNT(rc.id) FILTER (WHERE rc.outcome = 'success') AS success_cases,
   COUNT(rc.id) FILTER (WHERE rc.outcome = 'failure') AS failure_cases,
-  ROUND(AVG(rc.ctr), 4) AS actual_avg_ctr,
-  ROUND(AVG(rc.conversion_rate), 4) AS actual_avg_conversion_rate
+  ROUND(AVG(rc.ctr)::numeric, 4) AS actual_avg_ctr,
+  ROUND(AVG(rc.conversion_rate)::numeric, 4) AS actual_avg_conversion_rate
 FROM recommendation_scenarios rs
 LEFT JOIN recommendation_cases rc ON rc.scenario_id = rs.scenario_id
 WHERE rs.status = 'active'
@@ -853,7 +853,7 @@ INSERT INTO recommendation_algorithms (algorithm_id, name, type, description, de
 ('cb_tfidf', '基于TF-IDF的内容推荐', 'content_based', '使用TF-IDF计算内容相似度',
  '{"min_similarity": 0.3, "max_results": 20}'::jsonb),
 ('cb_embedding', '基于向量的内容推荐', 'content_based', '使用向量嵌入计算内容相似度',
- '{"embedding_dim": 2048, "similarity_threshold": 0.6}'::jsonb),
+ '{"embedding_dim": 2000, "similarity_threshold": 0.6}'::jsonb),
 ('hybrid_weighted', '加权混合推荐', 'hybrid', '结合多种算法的加权推荐',
  '{"cf_weight": 0.4, "cb_weight": 0.4, "kg_weight": 0.2}'::jsonb),
 ('kg_path_based', '基于知识图谱路径推荐', 'knowledge_graph', '通过知识图谱路径关系推荐',

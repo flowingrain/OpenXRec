@@ -348,7 +348,12 @@ export default function OpenXRecHome() {
             description: String(item.description || ''),
             score: Number(item.score ?? item.confidence ?? 0),
             confidence: Number(item.confidence ?? 0),
-            explanation: String(item.explanations?.[0]?.reason || item.reason || '基于综合分析推荐'),
+            explanation: String(
+              item.explanation ||
+                item.explanations?.[0]?.reason ||
+                item.reason ||
+                '基于综合分析推荐'
+            ),
             factors: Array.isArray(item.explanations?.[0]?.factors) ? item.explanations[0].factors : [],
             // 元数据（对比分析用）
             metadata: item.metadata,

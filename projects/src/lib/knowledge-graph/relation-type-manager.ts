@@ -9,6 +9,7 @@
  */
 
 import { LLMClient } from 'coze-coding-dev-sdk';
+import { getChatModelId } from '@/lib/llm/chat-model';
 
 // ==================== 预定义关系类型 ====================
 
@@ -375,7 +376,7 @@ ${existingTypesList}
       { role: 'system', content: '你是一个专业的关系抽取专家。' },
       { role: 'user', content: prompt },
     ], {
-      model: 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(),
       temperature: 0.3,
     });
 

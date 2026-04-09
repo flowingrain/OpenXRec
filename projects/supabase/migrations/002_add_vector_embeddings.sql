@@ -7,28 +7,25 @@
 -- 1. 启用 pgvector 扩展（如果尚未启用）
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- 2. 为 knowledge_docs 表添加向量列（2048维）
+-- 2. 为 knowledge_docs 表添加向量列（2000维）
 ALTER TABLE knowledge_docs 
-ADD COLUMN IF NOT EXISTS embedding vector(2048),
+ADD COLUMN IF NOT EXISTS embedding vector(2000),
 ADD COLUMN IF NOT EXISTS embedding_model varchar(100),
 ADD COLUMN IF NOT EXISTS embedding_generated_at timestamp with time zone;
 
--- 3. 为 kg_entities 表添加向量列（2048维）
+-- 3. 为 kg_entities 表添加向量列（2000维）
 ALTER TABLE kg_entities 
-ADD COLUMN IF NOT EXISTS embedding vector(2048),
+ADD COLUMN IF NOT EXISTS embedding vector(2000),
 ADD COLUMN IF NOT EXISTS embedding_model varchar(100),
 ADD COLUMN IF NOT EXISTS embedding_generated_at timestamp with time zone;
 
--- 4. 创建向量索引（HNSW 索引用于中小规模数据）
--- 注意：HNSW 索引适合中小规模数据，对于大规模数据可考虑 IVFFlat
+-- 4. 向量索引（2000 维，可用 HNSW）
 
--- 为 knowledge_docs 创建 HNSW 索引
 CREATE INDEX IF NOT EXISTS idx_knowledge_docs_embedding 
 ON knowledge_docs 
 USING hnsw (embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
--- 为 kg_entities 创建 HNSW 索引
 CREATE INDEX IF NOT EXISTS idx_kg_entities_embedding 
 ON kg_entities 
 USING hnsw (embedding vector_cosine_ops)
@@ -36,7 +33,7 @@ WITH (m = 16, ef_construction = 64);
 
 -- 5. 创建向量搜索函数 - 知识库文档
 CREATE OR REPLACE FUNCTION search_knowledge_docs(
-  query_embedding vector(2048),
+  query_embedding vector(2000),
   match_threshold float DEFAULT 0.5,
   match_count int DEFAULT 10,
   filter_file_type text DEFAULT NULL
@@ -72,7 +69,7 @@ $$;
 
 -- 6. 创建向量搜索函数 - 知识图谱实体
 CREATE OR REPLACE FUNCTION search_kg_entities(
-  query_embedding vector(2048),
+  query_embedding vector(2000),
   match_threshold float DEFAULT 0.3,
   match_count int DEFAULT 20,
   filter_entity_type text DEFAULT NULL
@@ -110,7 +107,7 @@ $$;
 
 -- 7. 创建向量搜索函数 - 案例库（使用 case_embeddings 表）
 CREATE OR REPLACE FUNCTION search_analysis_cases(
-  query_embedding vector(2048),
+  query_embedding vector(2000),
   match_threshold float DEFAULT 0.3,
   match_count int DEFAULT 5
 )
@@ -147,7 +144,7 @@ $$;
 -- 8. 创建批量更新嵌入的辅助函数
 CREATE OR REPLACE FUNCTION update_knowledge_doc_embedding(
   doc_id uuid,
-  new_embedding vector(2048),
+  new_embedding vector(2000),
   model_name varchar(100) DEFAULT 'doubao-embedding-vision-251215'
 )
 RETURNS boolean
@@ -169,7 +166,7 @@ $$;
 -- 9. 创建批量更新实体嵌入的辅助函数
 CREATE OR REPLACE FUNCTION update_entity_embedding(
   entity_id uuid,
-  new_embedding vector(2048),
+  new_embedding vector(2000),
   model_name varchar(100) DEFAULT 'doubao-embedding-vision-251215'
 )
 RETURNS boolean
@@ -205,10 +202,10 @@ SELECT
 FROM kg_entities;
 
 -- 11. 添加注释
-COMMENT ON COLUMN knowledge_docs.embedding IS '文档内容的向量嵌入（2048维）';
+COMMENT ON COLUMN knowledge_docs.embedding IS '文档内容的向量嵌入（2000维）';
 COMMENT ON COLUMN knowledge_docs.embedding_model IS '嵌入模型名称';
 COMMENT ON COLUMN knowledge_docs.embedding_generated_at IS '嵌入生成时间';
-COMMENT ON COLUMN kg_entities.embedding IS '实体名称+描述的向量嵌入（2048维）';
+COMMENT ON COLUMN kg_entities.embedding IS '实体名称+描述的向量嵌入（2000维）';
 COMMENT ON COLUMN kg_entities.embedding_model IS '嵌入模型名称';
 COMMENT ON COLUMN kg_entities.embedding_generated_at IS '嵌入生成时间';
 

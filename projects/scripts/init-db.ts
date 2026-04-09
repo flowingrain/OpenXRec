@@ -1,16 +1,24 @@
 /**
- * 执行 init.sql 数据库初始化脚本
- * 使用 pg 库直接连接数据库执行 DDL
+ * 执行 000_pre_vector_cleanup.sql + supabase/init.sql（核心表）
+ * 全量结构（含 002–006 迁移）请使用：pnpm db:migrate 或 pnpm db:sql-bundle
  */
 
 import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
+import { loadEnvLocal } from './load-env-local';
 
-const dbUrl = process.env.SUPABASE_DB_URL;
+loadEnvLocal();
+
+const dbUrl =
+  process.env.SUPABASE_DB_URL ||
+  process.env.DATABASE_URL ||
+  process.env.POSTGRES_URL;
 
 if (!dbUrl) {
-  console.error('❌ 错误: 请设置 SUPABASE_DB_URL 环境变量');
+  console.error(
+    '❌ 请设置 SUPABASE_DB_URL 或 DATABASE_URL（Postgres 直连，见 migrate-supabase.ts 顶部说明）'
+  );
   process.exit(1);
 }
 
@@ -25,15 +33,17 @@ async function initDatabase() {
   });
 
   try {
-    // 读取 SQL 文件
+    const cleanupPath = path.join(
+      __dirname,
+      '../supabase/migrations/000_pre_vector_cleanup.sql'
+    );
     const sqlPath = path.join(__dirname, '../supabase/init.sql');
-    const sql = fs.readFileSync(sqlPath, 'utf-8');
 
-    console.log('📄 读取 init.sql 文件成功');
+    console.log('📄 读取 000_pre_vector_cleanup.sql + init.sql');
     console.log('🔗 连接数据库...\n');
 
-    // 执行整个 SQL 脚本
-    await pool.query(sql);
+    await pool.query(fs.readFileSync(cleanupPath, 'utf-8'));
+    await pool.query(fs.readFileSync(sqlPath, 'utf-8'));
 
     console.log('✅ SQL 脚本执行成功！\n');
 

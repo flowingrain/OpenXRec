@@ -4,7 +4,9 @@
  * 支持多方博弈分析和决策预测
  */
 
-import { LLMClient, Config } from 'coze-coding-dev-sdk';
+import { LLMClient } from 'coze-coding-dev-sdk';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
+import { getChatModelId } from '@/lib/llm/chat-model';
 
 // ============================================================================
 // 类型定义
@@ -572,7 +574,7 @@ export async function personaAgentNode(
     { role: 'system', content: personaContext },
     { role: 'user', content: scenarioPrompt }
   ], {
-    model: 'doubao-seed-2-0-pro-260215',
+    model: getChatModelId(),
     temperature: 0.7
   });
   
@@ -794,6 +796,5 @@ function getTimeHorizonDescription(horizon: TimeHorizon): string {
 // ============================================================================
 
 export function createLLMClientForPersona(): LLMClient {
-  const config = new Config();
-  return new LLMClient(config);
+  return createLLMClient();
 }

@@ -1,8 +1,14 @@
+import { createHash } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseRecommendationKnowledgeManager } from '@/lib/recommendation/supabase-knowledge-integration';
 import { getSupabaseRecommendationMemoryManager } from '@/lib/recommendation/supabase-memory-integration';
 import { getSupabaseVectorStore } from '@/lib/vector/supabase-vector-store';
 import { createSufficiencyEvaluator } from '@/lib/recommendation/recommendation-types';
+import {
+  enrichRecommendationsWithBatchLLM,
+  getRecommendDisplayMax,
+} from '@/lib/recommendation/batch-llm-explanations';
+import { advancedWebSearch } from '@/lib/search/advanced-web-search';
 import { LLMClient, Config } from 'coze-coding-dev-sdk';
 
 /**
@@ -25,17 +31,49 @@ function getLLMClient(): LLMClient {
   return llmClientInstance;
 }
 
+function extractQueryFromBody(body: Record<string, unknown>): string {
+  const candidates = [
+    body.query,
+    (body.context as Record<string, unknown> | undefined)?.query,
+    body.message,
+    body.prompt,
+    body.text,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return '';
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { query, userProfile, context, sessionContext, skipSufficiencyCheck } = body;
+    const {
+      userProfile: bodyUserProfile,
+      context,
+      sessionContext: bodySessionContext,
+      skipSufficiencyCheck,
+      userId,
+    } = body;
+
+    const query = extractQueryFromBody(body);
 
     if (!query) {
       return NextResponse.json(
-        { success: false, error: '缺少查询内容' },
+        { success: false, error: '缺少查询内容（需要 query、context.query、message 等任一字段）' },
         { status: 400 }
       );
     }
+
+    const userProfile =
+      bodyUserProfile ?? (typeof userId === 'string' && userId ? { userId } : undefined);
+    const sessionContext = {
+      ...(typeof bodySessionContext === 'object' && bodySessionContext
+        ? bodySessionContext
+        : {}),
+      ...(typeof context === 'object' && context ? context : {}),
+      ...(typeof userId === 'string' ? { userId } : {}),
+    };
 
     console.log('[Recommendation API] Processing query:', query);
 
@@ -60,22 +98,33 @@ export async function POST(request: NextRequest) {
         
         if (!sufficiency.isSufficient && sufficiency.suggestedQuestions && sufficiency.suggestedQuestions.length > 0) {
           console.log('[Recommendation API] Need clarification, returning questions');
+          const followUpQuestions =
+            sufficiency.clarificationQuestions ||
+            sufficiency.suggestedQuestions.map((q: string, i: number) => ({
+              id: `q_${i}`,
+              question: q,
+              type: 'text',
+            }));
           return NextResponse.json({
             success: true,
             data: {
+              items: [],
               needsClarification: true,
               sufficiency: {
                 score: sufficiency.score,
                 isSufficient: sufficiency.isSufficient,
-                missingFields: sufficiency.missingFields
+                missingFields: sufficiency.missingFields,
               },
-              followUpQuestions: sufficiency.clarificationQuestions || sufficiency.suggestedQuestions.map((q, i) => ({
-                id: `q_${i}`,
-                question: q,
-                type: 'text'
-              })),
-              explanation: '为了给您提供更精准的推荐，我需要了解一些额外信息。'
-            }
+              followUpQuestions,
+              explanation: '为了给您提供更精准的推荐，我需要了解一些额外信息。',
+              metadata: {
+                clarification: {
+                  needsClarification: true,
+                  sufficiency,
+                  followUpQuestions,
+                },
+              },
+            },
           });
         }
       } catch (error: any) {
@@ -99,6 +148,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         success: true,
         data: {
+          items: [],
           recommendations: {
             items: [],
             strategy: '无匹配结果',
@@ -107,25 +157,33 @@ export async function POST(request: NextRequest) {
               selectedCount: 0,
               diversityScore: 0,
               noveltyScore: 0,
-              confidence: 0
-            }
+              confidence: 0,
+            },
           },
-          explanation: '抱歉，暂时没有找到符合您需求的推荐。请尝试提供更详细的信息或调整您的查询内容。'
-        }
+          explanation:
+            '未检索到可用推荐。请确认：1）联网检索已配置且可用（WEB_SEARCH_PROVIDER / Coze 或 WEB_SEARCH_HTTP_URL）；2）向量嵌入服务正常以便检索历史案例；3）知识库中是否有相关内容。',
+        },
       });
     }
 
     // 3. 优化推荐结果（多样性、新颖性）
-    const optimized = await optimizeRecommendations(candidates, userProfile);
+    let optimized = await optimizeRecommendations(candidates, userProfile);
     console.log('[Recommendation API] Optimized to:', optimized.length);
 
-    // 4. 生成推荐解释
-    const explanation = generateExplanation(query, optimized, userProfile);
+    const displayMax = getRecommendDisplayMax();
+    optimized = optimized.slice(0, displayMax);
+    console.log('[Recommendation API] Display cap:', displayMax, '→ items:', optimized.length);
+
+    // 3.5 单次 LLM 调用为每条展示项生成理由（条数 ≤ displayMax，一次请求内完成）
+    optimized = await enrichRecommendationsWithBatchLLM(query, optimized);
+
+    // 4. 生成整体说明（模板；单条理由已在上一歩写入 explanation）
+    const explanation = generateExplanation(query, optimized, userProfile, intent.strategy);
 
     // 5. 返回推荐结果
     const recommendations = {
       items: optimized,
-      strategy: intent.strategy || '知识增强推荐',
+      strategy: intent.strategy || '联网检索与知识融合',
       metadata: {
         totalCandidates: candidates.length,
         selectedCount: optimized.length,
@@ -155,9 +213,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       data: {
+        items: optimized,
         recommendations,
-        explanation
-      }
+        explanation,
+        metadata: recommendations.metadata,
+      },
     });
 
   } catch (error: any) {
@@ -214,8 +274,82 @@ function analyzeQueryIntent(query: string): {
   return { type, strategy, interests };
 }
 
+/** 联网检索 → 推荐候选（含可点击来源） */
+async function fetchWebSearchCandidates(
+  query: string,
+  intent: { type: string; interests: string[] }
+): Promise<any[]> {
+  const count = Math.min(
+    15,
+    Math.max(5, parseInt(process.env.RECOMMENDATION_WEB_SEARCH_COUNT || '12', 10) || 12)
+  );
+  try {
+    const res = await advancedWebSearch(
+      query,
+      { searchType: 'web', count, needSummary: true },
+      undefined
+    );
+    const raw = (res.web_items ?? res.results ?? []) as any[];
+    const out: any[] = [];
+    const seen = new Set<string>();
+
+    for (let i = 0; i < raw.length; i++) {
+      const item = raw[i];
+      const url = String(item.url || item.link || '').trim();
+      const title = String(item.title || item.name || '').trim() || '未命名结果';
+      const dedupeKey = url || `${title}_${i}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      let summary = '';
+      if (typeof item.summary === 'string') summary = item.summary;
+      else if (typeof item.snippet === 'string') summary = item.snippet;
+      else if (typeof item.content === 'string') summary = item.content.substring(0, 400);
+      summary = summary.trim().slice(0, 500);
+
+      const relRaw = item.relevance ?? item.score;
+      const rel =
+        typeof relRaw === 'number' && !Number.isNaN(relRaw)
+          ? Math.min(0.95, Math.max(0.5, relRaw))
+          : 0.9 - i * 0.02;
+
+      const idKey = url || title;
+      const id = `web_${createHash('sha1').update(idKey).digest('hex').slice(0, 24)}`;
+
+      out.push({
+        id,
+        title,
+        type: intent.type,
+        description: summary || title,
+        url,
+        source: String(item.source || item.site || '网络').slice(0, 120),
+        sourceUrl: url,
+        score: rel,
+        confidence: Math.min(0.92, rel),
+        explanation: url
+          ? `联网检索 · ${String(item.source || item.site || '来源待核').slice(0, 80)}`
+          : '联网检索（无有效链接，请核对来源）',
+        knowledgeSources: url ? [{ title, url, relevance: rel }] : [],
+        features: {
+          category: intent.type,
+          tags: intent.interests,
+          attributes: { matchType: 'web_search', url: url || undefined },
+        },
+      });
+    }
+
+    if (out.length) {
+      console.log('[Recommendation API] Web search candidates:', out.length);
+    }
+    return out;
+  } catch (e) {
+    console.error('[Recommendation API] Web search failed:', e);
+    return [];
+  }
+}
+
 /**
- * 生成候选推荐
+ * 生成候选推荐（联网检索 + 向量 + 知识库；无模板/mock）
  */
 async function generateCandidates(
   query: string,
@@ -226,38 +360,32 @@ async function generateCandidates(
 ): Promise<any[]> {
   const candidates: any[] = [];
 
-  // 策略1: 基于兴趣匹配
-  if (intent.interests.length > 0) {
-    for (const interest of intent.interests) {
-      const items = await generateInterestBasedCandidates(interest, intent.type, userProfile);
-      candidates.push(...items);
-    }
-  }
+  const webItems = await fetchWebSearchCandidates(query, intent);
+  candidates.push(...webItems);
 
-  // 策略2: 基于向量检索
   try {
     const vectorResults = await vectorStore.search(query, {
       topK: 5,
       threshold: 0.6,
-      embeddingType: intent.type
+      embeddingType: intent.type,
     });
 
-    for (const result of vectorResults.slice(0, 3)) {
-      if (!candidates.some(c => c.id === result.entry.caseId)) {
+    for (const result of vectorResults.slice(0, 5)) {
+      if (!candidates.some((c) => c.id === result.entry.caseId)) {
         candidates.push({
           id: result.entry.caseId,
           title: generateTitleFromVector(result.entry),
           type: intent.type,
-          description: result.entry.textPreview || `基于向量检索找到的${intent.type}`,
+          description: result.entry.textPreview || `基于向量检索的${intent.type}相关案例`,
           score: result.similarity,
           confidence: Math.min(result.similarity, 0.95),
-          explanation: `通过向量相似度匹配，与您的查询高度相关（相似度 ${(result.similarity * 100).toFixed(0)}%）`,
+          explanation: `向量相似度 ${(result.similarity * 100).toFixed(0)}%，来自历史案例库`,
           knowledgeSources: [],
           features: {
             category: intent.type,
             tags: intent.interests,
-            attributes: { matchType: 'vector' }
-          }
+            attributes: { matchType: 'vector' },
+          },
         });
       }
     }
@@ -265,32 +393,30 @@ async function generateCandidates(
     console.error('[Recommendation API] Vector search failed:', error);
   }
 
-  // 策略3: 基于知识库检索
   try {
     const knowledgeResults = await knowledgeManager.queryRecommendationKnowledge(query, {
-      limit: 3
+      limit: 5,
     });
 
     for (const result of knowledgeResults) {
       const itemId = `kb_${result.entry.id}`;
-      if (!candidates.some(c => c.id === itemId)) {
+      if (!candidates.some((c) => c.id === itemId)) {
         candidates.push({
           id: itemId,
           title: result.entry.title,
           type: 'article',
-          description: result.entry.content.substring(0, 100),
+          description: result.entry.content.substring(0, 200),
           score: result.relevance,
           confidence: Math.min(result.relevance * 0.9, 0.9),
-          explanation: result.entry.description || `从知识库中检索到相关内容（相关度 ${(result.relevance * 100).toFixed(0)}%）`,
-          knowledgeSources: [{
-            title: result.entry.title,
-            relevance: result.relevance
-          }],
+          explanation:
+            result.entry.description ||
+            `知识库命中（相关度 ${(result.relevance * 100).toFixed(0)}%）`,
+          knowledgeSources: [{ title: result.entry.title, relevance: result.relevance }],
           features: {
             category: result.entry.metadata?.type || 'knowledge',
             tags: result.entry.metadata?.tags || [],
-            attributes: { source: 'knowledge_base' }
-          }
+            attributes: { source: 'knowledge_base' },
+          },
         });
       }
     }
@@ -298,103 +424,7 @@ async function generateCandidates(
     console.error('[Recommendation API] Knowledge search failed:', error);
   }
 
-  // 如果候选不足，生成模拟数据
-  if (candidates.length < 3) {
-    const mockCandidates = generateMockCandidates(query, intent, 3 - candidates.length);
-    candidates.push(...mockCandidates);
-  }
-
-  // 按分数排序
   return candidates.sort((a, b) => b.score - a.score);
-}
-
-/**
- * 生成基于兴趣的候选
- */
-async function generateInterestBasedCandidates(
-  interest: string,
-  type: string,
-  userProfile: any
-): Promise<any[]> {
-  const candidates: any[] = [];
-
-  const templates = {
-    '科技': [
-      { title: `智能${type}推荐系统`, description: `基于${interest}领域的最新${type}推荐，结合AI技术提供个性化体验` },
-      { title: `${interest}创新产品解析`, description: `深入分析${interest}领域的创新${type}，了解技术趋势和应用场景` },
-      { title: `${interest}数据驱动决策`, description: `利用数据驱动的方法优化${interest}相关的${type}选择和决策过程` }
-    ],
-    '阅读': [
-      { title: `${type}推荐：必读经典`, description: `精选${interest}领域的经典${type}，为您提供深度阅读体验` },
-      { title: `${interest}主题书单`, description: `围绕${interest}主题精选的${type}清单，适合不同阅读水平` },
-      { title: `${interest}阅读方法指南`, description: `学习高效的${interest}阅读方法，提升${type}理解和吸收能力` }
-    ],
-    '产品': [
-      { title: `${interest}设计原则`, description: `掌握${interest}领域的核心设计原则，打造优秀${type}` },
-      { title: `${interest}用户体验优化`, description: `基于用户体验理论优化${interest}相关的${type}设计` },
-      { title: `${interest}产品案例分析`, description: `分析成功的${interest}${type}案例，学习最佳实践` }
-    ],
-    'default': [
-      { title: `${interest}领域${type}精选`, description: `为您精选${interest}领域的高质量${type}` },
-      { title: `${interest}趋势分析`, description: `深度分析${interest}领域的最新趋势和未来方向` },
-      { title: `${interest}实践指南`, description: `提供${interest}领域的实用指南和操作方法` }
-    ]
-  };
-
-  const interestTemplates = templates[interest as keyof typeof templates] || templates.default;
-
-  for (let i = 0; i < Math.min(interestTemplates.length, 2); i++) {
-    const template = interestTemplates[i];
-    candidates.push({
-      id: `interest_${interest}_${i}`,
-      title: template.title,
-      type: type,
-      description: template.description,
-      score: 0.85 - i * 0.05,
-      confidence: 0.8,
-      explanation: `基于您对"${interest}"的兴趣，为您推荐这篇${type}`,
-      knowledgeSources: [{
-        title: `${interest}知识库`,
-        relevance: 0.8
-      }],
-      features: {
-        category: interest,
-        tags: [interest, type],
-        attributes: { source: 'interest_match' }
-      }
-    });
-  }
-
-  return candidates;
-}
-
-/**
- * 生成模拟候选
- */
-function generateMockCandidates(query: string, intent: any, count: number): any[] {
-  const candidates: any[] = [];
-  const types = ['product', 'article', 'course'];
-
-  for (let i = 0; i < count; i++) {
-    const randomType = types[Math.floor(Math.random() * types.length)];
-    candidates.push({
-      id: `mock_${Date.now()}_${i}`,
-      title: `${query} - ${randomType}推荐 ${i + 1}`,
-      type: randomType,
-      description: `这是一个关于"${query}"的${randomType}推荐项，包含丰富的内容和实践指导`,
-      score: 0.75 - i * 0.05,
-      confidence: 0.7,
-      explanation: `基于您的查询"${query}"生成的推荐${randomType}`,
-      knowledgeSources: [],
-      features: {
-        category: intent.type || 'general',
-        tags: intent.interests,
-        attributes: { source: 'mock' }
-      }
-    });
-  }
-
-  return candidates;
 }
 
 /**
@@ -442,15 +472,17 @@ async function optimizeRecommendations(
 }
 
 /**
- * 生成推荐解释
+ * 生成整体说明文案（模板拼接，非逐条调用大模型）。
+ * 单条「推荐理由」来自候选或后续批量 LLM 写入的 explanation。
  */
 function generateExplanation(
   query: string,
   recommendations: any[],
-  userProfile: any
+  userProfile: any,
+  strategyHint?: string
 ): string {
   const topItem = recommendations[0];
-  const strategy = topItem?.strategy || '混合推荐';
+  const strategy = strategyHint || topItem?.strategy || '联网检索与知识融合';
   const confidence = (topItem?.confidence * 100).toFixed(0);
 
   let explanation = `根据您的需求"${query}"，我为您找到了 **${recommendations.length}** 个推荐项。\n\n`;

@@ -323,7 +323,7 @@ SELECT
   v.tags,
   v.created_at,
   COUNT(e.id) as effect_count,
-  AVG(e.metrics->>'avgReward') as avg_effect_reward,
+  AVG((NULLIF(TRIM(e.metrics->>'avgReward'), ''))::double precision) as avg_effect_reward,
   SUM(e.usage_duration) as total_usage_duration
 FROM ppo_hyperparam_versions v
 LEFT JOIN ppo_hyperparam_effects e ON v.id = e.version_id

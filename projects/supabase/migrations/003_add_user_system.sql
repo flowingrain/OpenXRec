@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(token);
-CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at) WHERE expires_at > NOW();
+-- 部分索引的 WHERE 中不可使用 NOW()（非 IMMUTABLE）；改为整列索引即可支持按 expires_at 查询/清理
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
 
 -- ============================================================================
 -- 3. 交互历史表

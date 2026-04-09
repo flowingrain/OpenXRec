@@ -15,6 +15,7 @@ import {
 } from '@/lib/memory';
 import { getKnowledgeManager } from '@/lib/knowledge';
 import { createLLMClient } from '@/lib/langgraph/nodes';
+import { getChatModelId } from '@/lib/llm/chat-model';
 
 // 内存存储单例
 const memoryStore = new InMemoryStore();
@@ -126,7 +127,7 @@ ${analysisContext.report ? `\n分析报告摘要：\n${analysisContext.report.su
       { role: 'system', content: systemPrompt },
       { role: 'user', content: message }
     ], {
-      model: process.env.LLM_MODEL || 'doubao-seed-2-0-pro-260215',
+      model: getChatModelId(process.env.LLM_MODEL),
       temperature: 0.7
     });
     

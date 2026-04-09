@@ -27,7 +27,8 @@ import {
   reviewAnalystNode,
   executeAgentWithFallback
 } from './nodes';
-import { LLMClient, SearchClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
+import { LLMClient, HeaderUtils } from 'coze-coding-dev-sdk';
+import { advancedWebSearch } from '@/lib/search/advanced-web-search';
 import { getCanonicalAgentId, getAgentDisplayConfig, AGENT_LAYERS } from './agent-config';
 
 /**
@@ -1048,9 +1049,7 @@ export async function executeAnalysis(
   confidence: number;
 }> {
   const llmClient = createLLMClient(customHeaders);
-  const config = new Config();
-  const searchClient = new SearchClient(config, customHeaders);
-  
+
   let state: Partial<AnalysisStateType> = {
     query,
     messages: [],
@@ -1165,12 +1164,16 @@ export async function executeAnalysis(
     let searchResults = { summary: '', items: [] as SearchItem[] };
     
     try {
-      searchResponse = await searchClient.advancedSearch(query, {
-        count: 20,  // 增加到20条
-        needSummary: true,
-        needContent: true,
-        timeRange: '1m',
-      });
+      searchResponse = await advancedWebSearch(
+        query,
+        {
+          count: 20, // 增加到20条
+          needSummary: true,
+          needContent: true,
+          timeRange: '1m',
+        },
+        customHeaders
+      );
       
       // 原始搜索结果
       rawItems = (searchResponse.web_items || []).map(item => ({
@@ -1631,12 +1634,16 @@ export async function executeAnalysis(
             // 重新搜索
             callbacks.onSystem?.('🔍 重新进行信息检索...');
             // 重新执行搜索
-            const newSearchResponse = await searchClient.advancedSearch(query, {
-              count: 20,
-              needSummary: true,
-              needContent: true,
-              timeRange: '1m',
-            });
+            const newSearchResponse = await advancedWebSearch(
+              query,
+              {
+                count: 20,
+                needSummary: true,
+                needContent: true,
+                timeRange: '1m',
+              },
+              customHeaders
+            );
             const newSearchResults = {
               summary: newSearchResponse.summary || '',
               items: (newSearchResponse.web_items || []).map(item => ({

@@ -51,7 +51,7 @@ interface VectorSearchResult {
 export class VectorStorageService {
   private embeddingClient: EmbeddingClient;
   private embeddingModel = 'doubao-embedding-vision-251215';
-  private embeddingDimensions = 2048;
+  private embeddingDimensions = 2000;
 
   constructor() {
     this.embeddingClient = new EmbeddingClient();

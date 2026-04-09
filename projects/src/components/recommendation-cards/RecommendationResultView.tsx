@@ -282,7 +282,7 @@ function convertToRecommendationItems(data: any): TemplateOutput {
       confidence: item.confidence,
       explanations: item.explanations || [{
         type: '综合推荐',
-        reason: item.explanations?.[0]?.reason || item.reason || '基于综合分析推荐',
+        reason: item.explanation || item.explanations?.[0]?.reason || item.reason || '基于综合分析推荐',
         factors: item.explanations?.[0]?.factors || [],
       }],
       source: item.source,

@@ -99,25 +99,34 @@ export class SupabaseRecommendationMemoryManager {
   }): Promise<void> {
     const { userId, itemId, feedbackType, rating, comment, context } = feedback;
 
-    // 1. 插入到 user_feedbacks 表
-    const { data, error } = await this.supabase
-      .from('user_feedbacks')
-      .insert({
-        case_id: itemId, // 使用 snake_case 字段名
-        feedback_type: feedbackType,
-        rating: rating,
-        comment: comment,
-        user_context: context
-      })
-      .select()
-      .single();
+    // user_feedbacks.case_id 为 UUID；非 UUID 占位 id 仅更新偏好，避免 22P02
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    if (error) {
-      console.error('[SupabaseRecommendationMemory] Failed to record feedback:', error);
-      throw error;
+    if (uuidRe.test(itemId)) {
+      const { error } = await this.supabase
+        .from('user_feedbacks')
+        .insert({
+          case_id: itemId,
+          feedback_type: feedbackType,
+          rating: rating,
+          comment: comment,
+          user_context: context,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error('[SupabaseRecommendationMemory] Failed to record feedback:', error);
+        throw error;
+      }
+    } else {
+      console.warn(
+        '[SupabaseRecommendationMemory] Skip user_feedbacks insert (itemId is not a case UUID):',
+        itemId
+      );
     }
 
-    // 2. 更新用户偏好
+    // 更新用户偏好（不依赖 case 外键）
     await this.updateUserPreferences(userId, {
       itemId,
       feedbackType,
