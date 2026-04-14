@@ -161,6 +161,10 @@ export class AgentRecommendationService {
   ): Promise<AgentRecommendationResult> {
     const startTime = Date.now();
     const agentsUsed: string[] = [];
+    const phaseTimings: Record<string, number> = {};
+    const markPhase = (name: string, phaseStart: number) => {
+      phaseTimings[name] = Date.now() - phaseStart;
+    };
 
     console.log('[AgentRecommendationService] Starting agent-based recommendation...');
     console.log('[AgentRecommendationService] Query:', query);
@@ -170,7 +174,9 @@ export class AgentRecommendationService {
       // 阶段1：意图分析智能体
       // ========================================
       console.log('[AgentRecommendationService] Phase 1: Intent Analysis Agent');
+      const phase1Start = Date.now();
       const intentResult = await this.runIntentAnalyzer(query, context.scenario);
+      markPhase('intent_analysis', phase1Start);
       agentsUsed.push('intent_analyzer');
       
       console.log('[AgentRecommendationService] Intent:', {
@@ -185,7 +191,17 @@ export class AgentRecommendationService {
       // ========================================
       if (intentResult.queryType === 'comparison_analysis') {
         console.log('[AgentRecommendationService] Routing to Comparison Analysis flow');
-        return this.generateComparisonAnalysis(query, context, intentResult);
+        const comparisonStart = Date.now();
+        const comparisonResult = await this.generateComparisonAnalysis(query, context, intentResult);
+        markPhase('comparison_analysis', comparisonStart);
+        phaseTimings.total = Date.now() - startTime;
+        comparisonResult.metadata = {
+          ...comparisonResult.metadata,
+          phaseTimings,
+          serviceTotalMs: phaseTimings.total,
+        };
+        console.log('[AgentRecommendationService] Phase timings (ms):', phaseTimings);
+        return comparisonResult;
       }
 
       const executionPlan = this.planExecutionByComplexity(query, context, intentResult);
@@ -196,7 +212,9 @@ export class AgentRecommendationService {
       // 阶段2：候选生成（LLM + 外部知识）
       // ========================================
       console.log('[AgentRecommendationService] Phase 2: Candidate Generation');
+      const phase2Start = Date.now();
       const candidates = await this.generateCandidates(query, context);
+      markPhase('candidate_generation', phase2Start);
       agentsUsed.push('candidate_generator');
 
       console.log('[AgentRecommendationService] Generated candidates:', candidates.length);
@@ -205,7 +223,9 @@ export class AgentRecommendationService {
       // 阶段3：特征提取智能体
       // ========================================
       console.log('[AgentRecommendationService] Phase 3: Feature Extraction Agent');
+      const phase3Start = Date.now();
       const itemsWithFeatures = await this.runFeatureExtractor(candidates, query, context);
+      markPhase('feature_extraction', phase3Start);
       agentsUsed.push('feature_extractor');
 
       // ========================================
@@ -217,14 +237,17 @@ export class AgentRecommendationService {
       const kgTask = executionPlan.useKnowledgeGraphReasoning
         ? this.runKGReasoner(query, itemsWithFeatures)
         : Promise.resolve(new Map<string, KGEvidence[]>());
-
+      const phase31Start = Date.now();
       const [similarities, kgRelations] = await Promise.all([
         similarityTask,
         kgTask,
       ]);
+      markPhase('similarity_and_kg', phase31Start);
+      const phase32Start = Date.now();
       const causalChain = executionPlan.useCausalReasoning
         ? await this.runCausalReasoner(query, itemsWithFeatures, kgRelations)
         : new Map<string, string>();
+      markPhase('causal_reasoning', phase32Start);
       if (executionPlan.useSimilarity) agentsUsed.push('similarity_calculator');
       if (executionPlan.useKnowledgeGraphReasoning) agentsUsed.push('kg_reasoner');
       if (executionPlan.useCausalReasoning) agentsUsed.push('causal_reasoner');
@@ -233,6 +256,7 @@ export class AgentRecommendationService {
       // 阶段4：评分与排序智能体（增强版）
       // ========================================
       console.log('[AgentRecommendationService] Phase 4: Enhanced Ranking Agent');
+      const phase4Start = Date.now();
       const rankedItems = await this.runRankingAgent(
         itemsWithFeatures,
         query,
@@ -242,12 +266,14 @@ export class AgentRecommendationService {
         kgRelations,
         userSegment
       );
+      markPhase('ranking', phase4Start);
       agentsUsed.push('ranking_agent');
 
       // ========================================
       // 阶段5：解释生成智能体（核心！）
       // ========================================
       console.log('[AgentRecommendationService] Phase 5: Explanation Generation Agent');
+      const phase5Start = Date.now();
       const itemsWithExplanations = await this.runExplanationGenerator(
         rankedItems,
         query,
@@ -261,6 +287,7 @@ export class AgentRecommendationService {
         kgRelations,
         causalChain
       );
+      markPhase('explanation_generation', phase5Start);
       agentsUsed.push('explanation_generator');
 
       // ========================================
@@ -269,7 +296,9 @@ export class AgentRecommendationService {
       let optimizedItems = itemsWithExplanations;
       if (executionPlan.useDiversityOptimizer) {
         console.log('[AgentRecommendationService] Phase 6: Diversity Optimization Agent');
+        const phase6Start = Date.now();
         optimizedItems = await this.runDiversityOptimizer(itemsWithExplanations);
+        markPhase('diversity_optimization', phase6Start);
         agentsUsed.push('diversity_optimizer');
       }
 
@@ -305,6 +334,8 @@ export class AgentRecommendationService {
         20,
         Math.max(1, this.config.maxReturnItems ?? 5)
       );
+      phaseTimings.total = Date.now() - startTime;
+      console.log('[AgentRecommendationService] Phase timings (ms):', phaseTimings);
 
       return {
         items: optimizedItems.slice(0, maxItems),
@@ -316,6 +347,8 @@ export class AgentRecommendationService {
           reasoningChain,
           queryType: 'recommendation' as const,
           userSegment,
+          phaseTimings,
+          serviceTotalMs: phaseTimings.total,
         },
       };
     } catch (error) {

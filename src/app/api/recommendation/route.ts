@@ -95,7 +95,17 @@ async function persistRecommendationCase(params: {
 
 export async function POST(request: NextRequest) {
   try {
+    const requestStart = Date.now();
+    const stepTimings: Record<string, number> = {};
+    const markStep = (name: string, start: number) => {
+      stepTimings[name] = Date.now() - start;
+    };
+
+    const parseStart = Date.now();
     const body = await request.json();
+    markStep('parse_request', parseStart);
+
+    const profileMergeStart = Date.now();
     const {
       userProfile: bodyUserProfile,
       context,
@@ -119,8 +129,53 @@ export async function POST(request: NextRequest) {
       ...(typeof context === 'object' && context ? context : {}),
       ...(typeof userId === 'string' ? { userId } : {}),
     };
+    const scenario =
+      typeof sessionContext === 'object' && sessionContext && 'scenario' in sessionContext
+        ? String((sessionContext as Record<string, unknown>).scenario)
+        : undefined;
+    const cacheKey = buildCacheKey(query, scenario, typeof userId === 'string' ? userId : undefined);
 
     console.log('[Recommendation API] Processing query:', query);
+
+    // 热路径优化：TTL 命中时直接返回，避免后续 sufficiency / web_search / agent 耗时。
+    const ttlCacheStart = Date.now();
+    if (!forceRefresh) {
+      const cached = getCachedRecommendation(cacheKey);
+      markStep('ttl_cache_lookup', ttlCacheStart);
+      if (cached) {
+        stepTimings.total = Date.now() - requestStart;
+        const cachedResponseData = {
+          ...cached,
+          metadata: {
+            ...(cached.metadata || {}),
+            cacheHit: true,
+            cacheType: 'ttl',
+            cacheTtlMs: RECOMMENDATION_TTL_MS,
+            routeTimings: stepTimings,
+            routeTotalMs: stepTimings.total,
+          },
+        };
+        try {
+          await persistRecommendationCase({
+            query,
+            scenario,
+            explanation: cachedResponseData.explanation,
+            confidence: Number(cachedResponseData?.metadata?.confidence ?? 0.7),
+            responseData: cachedResponseData,
+            source: 'ttl_cache',
+          });
+        } catch (e) {
+          console.warn('[Recommendation API] ttl cache case persistence skipped:', e);
+        }
+        console.log('[Recommendation API] Step timings (ms):', stepTimings);
+        return NextResponse.json({
+          success: true,
+          data: cachedResponseData,
+        });
+      }
+    } else {
+      markStep('ttl_cache_lookup', ttlCacheStart);
+    }
 
     const memoryManager = getSupabaseRecommendationMemoryManager();
 
@@ -162,13 +217,16 @@ export async function POST(request: NextRequest) {
         behaviorHistory: [],
       };
     }
+    markStep('prepare_profile_context', profileMergeStart);
 
     if (!skipSufficiencyCheck) {
       console.log('[Recommendation API] Starting sufficiency evaluation...');
+      const suffStart = Date.now();
       try {
         const llmClient = getLLMClient();
         const evaluator = createSufficiencyEvaluator(llmClient);
         const sufficiency = await evaluator.evaluate(query, sessionContext);
+        markStep('sufficiency_evaluation', suffStart);
 
         if (
           !sufficiency.isSufficient &&
@@ -205,6 +263,7 @@ export async function POST(request: NextRequest) {
           });
         }
       } catch (error: unknown) {
+        markStep('sufficiency_evaluation', suffStart);
         console.error('[Recommendation API] Sufficiency evaluation failed:', error);
       }
     }
@@ -215,6 +274,7 @@ export async function POST(request: NextRequest) {
     });
 
     let webContext = '';
+    const webSearchStart = Date.now();
     try {
       const wr = await advancedWebSearch(query, {
         searchType: 'web',
@@ -241,44 +301,12 @@ export async function POST(request: NextRequest) {
       });
     } catch (e) {
       console.warn('[Recommendation API] Web context fetch skipped:', e);
+    } finally {
+      markStep('web_search', webSearchStart);
     }
 
-    const scenario =
-      typeof sessionContext === 'object' && sessionContext && 'scenario' in sessionContext
-        ? String((sessionContext as Record<string, unknown>).scenario)
-        : undefined;
-    const cacheKey = buildCacheKey(query, scenario, typeof userId === 'string' ? userId : undefined);
-
+    const vectorReuseStart = Date.now();
     if (!forceRefresh) {
-      const cached = getCachedRecommendation(cacheKey);
-      if (cached) {
-        const cachedResponseData = {
-          ...cached,
-          metadata: {
-            ...(cached.metadata || {}),
-            cacheHit: true,
-            cacheType: 'ttl',
-            cacheTtlMs: RECOMMENDATION_TTL_MS,
-          },
-        };
-        try {
-          await persistRecommendationCase({
-            query,
-            scenario,
-            explanation: cachedResponseData.explanation,
-            confidence: Number(cachedResponseData?.metadata?.confidence ?? 0.7),
-            responseData: cachedResponseData,
-            source: 'ttl_cache',
-          });
-        } catch (e) {
-          console.warn('[Recommendation API] ttl cache case persistence skipped:', e);
-        }
-        return NextResponse.json({
-          success: true,
-          data: cachedResponseData,
-        });
-      }
-
       try {
         const similar = await embeddingService.searchSimilarCases(query, { limit: 1, threshold: 0.92 });
         const best = similar[0];
@@ -324,10 +352,15 @@ export async function POST(request: NextRequest) {
         }
       } catch (e) {
         console.warn('[Recommendation API] vector reuse skipped:', e);
+      } finally {
+        markStep('vector_reuse_lookup', vectorReuseStart);
       }
+    } else {
+      markStep('vector_reuse_lookup', vectorReuseStart);
     }
 
     let agentResult: AgentRecommendationResult;
+    const agentStart = Date.now();
     try {
       const sessionHints =
         sessionContext && typeof sessionContext === 'object'
@@ -340,7 +373,9 @@ export async function POST(request: NextRequest) {
         userProfile: mergedUserProfile,
         sessionHints,
       });
+      markStep('agent_generate_recommendations', agentStart);
     } catch (recErr: unknown) {
+      markStep('agent_generate_recommendations', agentStart);
       console.error('[Recommendation API] Agent recommendation failed:', recErr);
       return NextResponse.json({
         success: true,
@@ -389,6 +424,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    const mapResponseStart = Date.now();
     const items = agentResult.items.map((it) => {
       const ex0 = it.explanations?.[0];
       const diff =
@@ -444,11 +480,15 @@ export async function POST(request: NextRequest) {
         ...agentResult.metadata,
         queryType: agentResult.metadata.queryType,
         cacheHit: false,
+        routeTimings: stepTimings,
+        routeTotalMs: Date.now() - requestStart,
       },
     };
+    markStep('build_response_payload', mapResponseStart);
 
     setCachedRecommendation(cacheKey, responseData);
 
+    const persistStart = Date.now();
     try {
       await persistRecommendationCase({
         query,
@@ -460,7 +500,14 @@ export async function POST(request: NextRequest) {
       });
     } catch (e) {
       console.warn('[Recommendation API] analysis case persistence skipped:', e);
+    } finally {
+      markStep('persist_recommendation_case', persistStart);
     }
+
+    stepTimings.total = Date.now() - requestStart;
+    responseData.metadata.routeTimings = stepTimings;
+    responseData.metadata.routeTotalMs = stepTimings.total;
+    console.log('[Recommendation API] Step timings (ms):', stepTimings);
 
     return NextResponse.json({
       success: true,
