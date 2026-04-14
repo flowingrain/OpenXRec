@@ -1264,7 +1264,8 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
   /**
    * 解释生成智能体（核心！）
    *
-   * 多推荐时优先一次生成对比式理由；单条或批量失败时回退逐条生成。
+   * 默认复用前序推理结果进行模板化解释（低 token）。
+   * 显式开启 LLM 解释时，走对比批量/逐条生成路径。
    */
   private async runExplanationGenerator(
     items: Array<{
@@ -1291,6 +1292,10 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
     causalChain?: Map<string, string>
   ): Promise<AgentRecommendationItem[]> {
     console.log('[ExplanationGenerator] Generating explanations for', items.length, 'items');
+
+    if (!this.shouldUseLLMExplanations()) {
+      return this.buildTemplateExplanations(items, userSegment, kgRelations, causalChain);
+    }
 
     const userPerspective = await this.buildUserPerspectiveNarrative(query, context);
 
@@ -1345,6 +1350,117 @@ ${context.webContext ? `\n检索片段：${context.webContext.slice(0, 550)}` : 
     );
 
     return explanations;
+  }
+
+  /**
+   * 解释阶段默认走模板化（低 token），仅在显式配置时开启 LLM。
+   */
+  private shouldUseLLMExplanations(): boolean {
+    const mode = process.env.RECOMMENDATION_EXPLANATION_MODE?.trim().toLowerCase();
+    if (mode === 'llm') return true;
+    if (mode === 'template') return false;
+
+    const flag = process.env.RECOMMENDATION_USE_LLM_EXPLANATIONS?.trim().toLowerCase();
+    if (flag === '1' || flag === 'true' || flag === 'yes') return true;
+    if (flag === '0' || flag === 'false' || flag === 'no') return false;
+
+    return false;
+  }
+
+  /**
+   * 模板化解释：复用排序/相似度/KG/因果推理结果，避免重复大模型调用。
+   */
+  private buildTemplateExplanations(
+    items: Array<{
+      id: string;
+      title: string;
+      description: string;
+      source: string;
+      features: Record<string, any>;
+      score: number;
+      confidence: number;
+      matchReasons: string[];
+    }>,
+    userSegment?: UserSegmentProfile,
+    kgRelations?: Map<string, KGEvidence[]>,
+    causalChain?: Map<string, string>
+  ): AgentRecommendationItem[] {
+    const sortedItems = [...items].sort((a, b) => b.score - a.score);
+
+    return sortedItems.map((item, idx) => {
+      const kgEvidence = kgRelations?.get(item.id);
+      const causalReasoning = causalChain?.get(item.id);
+      const baseReason = this.generateFallbackReason(item, { scenarioType: 'general' }, {});
+      const comparisonTag = this.buildTemplateDifferentiator(item, sortedItems, idx);
+
+      const factors: ExplanationFactor[] = [];
+      for (const reason of (item.matchReasons || []).slice(0, 2)) {
+        factors.push({
+          name: '用户需求匹配',
+          value: reason,
+          importance: Math.max(0.5, Math.min(1, item.score)),
+          category: 'user',
+        });
+      }
+      for (const rel of (kgEvidence || []).slice(0, 2)) {
+        factors.push({
+          name: rel.kind === 'causal_hint' ? '知识图谱因果线索' : '知识图谱关联证据',
+          value: `${rel.relation}(${(rel.confidence * 100).toFixed(0)}%)`,
+          importance: Math.max(0.4, Math.min(1, rel.confidence)),
+          category: 'knowledge',
+        });
+      }
+      if (causalReasoning) {
+        factors.push({
+          name: '因果推理',
+          value: causalReasoning.slice(0, 120),
+          importance: 0.7,
+          category: 'context',
+        });
+      }
+
+      return {
+        id: item.id,
+        title: item.title,
+        description: item.description,
+        score: item.score,
+        confidence: item.confidence,
+        explanations: [
+          {
+            type: 'rule_based',
+            reason: this.formatEvidenceChainReason(
+              baseReason,
+              this.composeKGEvidenceLineFromItem(kgEvidence),
+              this.composeCausalEvidenceLineFromText(causalReasoning),
+              this.composeUserMatchLine(item.matchReasons, userSegment)
+            ),
+            factors,
+            weight: 1.0,
+            differentiator: comparisonTag,
+          },
+        ],
+        source: item.source,
+        metadata: {
+          features: item.features,
+          matchReasons: item.matchReasons,
+          comparison: this.buildComparisonMetadata(item, sortedItems),
+          explanationMode: 'template',
+        },
+      };
+    });
+  }
+
+  private buildTemplateDifferentiator(
+    current: { id: string; source: string; matchReasons?: string[] },
+    allItems: Array<{ id: string; source: string; matchReasons?: string[] }>,
+    index: number
+  ): string {
+    if (allItems.length <= 1) return '本批唯一推荐';
+    if (index === 0) return '综合评分最高，优先建议先看这一项';
+    const sameSourceCount = allItems.filter((it) => it.id !== current.id && it.source === current.source).length;
+    if (sameSourceCount === 0) return '来源差异化明显，可作为互补选项';
+    const reason = (current.matchReasons || [])[0];
+    return reason ? `更侧重：${reason}` : '适合作为备选方案进行对比';
   }
 
   /**

@@ -8,7 +8,7 @@
  * - 自动索引功能
  */
 
-import { EmbeddingClient } from 'coze-coding-dev-sdk';
+import { Config, EmbeddingClient } from 'coze-coding-dev-sdk';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 
 // ==================== 类型定义 ====================
@@ -114,12 +114,22 @@ interface EmbeddingStats {
  * 向量嵌入服务类
  */
 export class EmbeddingService {
-  private client: EmbeddingClient;
+  private cozeClient: EmbeddingClient | null = null;
+  private dashScopeApiKey =
+    process.env.EmbeddingService_API_KEY?.trim() || process.env.EMBEDDING_SERVICE_API_KEY?.trim() || '';
+  private dashScopeModel =
+    process.env.EMBEDDING_SERVICE_MODEL?.trim() || process.env.EmbeddingService_MODEL?.trim() || 'text-embedding-v4';
+  private dashScopeBaseUrl =
+    process.env.EMBEDDING_SERVICE_BASE_URL?.trim() ||
+    process.env.EmbeddingService_BASE_URL?.trim() ||
+    'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
   private embeddingModel = 'doubao-embedding-vision-251215';
   private embeddingDimensions = 2000;
+  private cozeEmbeddingDisabled = false;
+  private warnedCozeEmbeddingUnavailable = false;
 
   constructor() {
-    this.client = new EmbeddingClient();
+    this.cozeClient = new EmbeddingClient(new Config());
   }
 
   /**
@@ -138,7 +148,29 @@ export class EmbeddingService {
    * 获取文本嵌入向量
    */
   async embedText(text: string, dimensions?: number): Promise<number[]> {
-    return this.client.embedText(text, dimensions ? { dimensions } : undefined);
+    if (this.dashScopeApiKey) {
+      return this.embedTextByDashScope(text, dimensions);
+    }
+
+    if (this.cozeEmbeddingDisabled || !this.cozeClient) {
+      throw new Error('No embedding provider available');
+    }
+
+    try {
+      return await this.cozeClient.embedText(text, dimensions ? { dimensions } : undefined);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (message.toLowerCase().includes('invalid url') || message.toLowerCase().includes('networkerror')) {
+        this.cozeEmbeddingDisabled = true;
+        if (!this.warnedCozeEmbeddingUnavailable) {
+          this.warnedCozeEmbeddingUnavailable = true;
+          console.warn(
+            '[EmbeddingService] Coze Embedding unavailable in local runtime. Set EmbeddingService_API_KEY to use DashScope embedding.'
+          );
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -147,10 +179,79 @@ export class EmbeddingService {
   async embedTexts(texts: string[], dimensions?: number): Promise<number[][]> {
     const embeddings: number[][] = [];
     for (const text of texts) {
-      const embedding = await this.client.embedText(text, dimensions ? { dimensions } : undefined);
+      const embedding = await this.embedText(text, dimensions);
       embeddings.push(embedding);
     }
     return embeddings;
+  }
+
+  private async embedTextByDashScope(text: string, dimensions?: number): Promise<number[]> {
+    const requestPayloads: Array<Record<string, unknown>> = [
+      {
+        model: this.dashScopeModel,
+        input: { texts: [text] },
+      },
+      {
+        model: this.dashScopeModel,
+        input: { text },
+      },
+    ];
+
+    // DashScope 各模型维度参数兼容性不完全一致，默认不强制透传调用方的 dimensions。
+    // 如需指定维度，可通过环境变量显式开启。
+    const allowDimensionOverride = process.env.EMBEDDING_SERVICE_USE_DIMENSION === 'true';
+    if (allowDimensionOverride && dimensions && Number.isFinite(dimensions) && dimensions > 0) {
+      for (const payload of requestPayloads) {
+        payload.parameters = { dimension: dimensions };
+      }
+    }
+
+    const errors: string[] = [];
+
+    for (const payload of requestPayloads) {
+      const response = await fetch(this.dashScopeBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.dashScopeApiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const raw = await response.text();
+      if (!response.ok) {
+        errors.push(`DashScope ${response.status}: ${raw.slice(0, 500)}`);
+        continue;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        errors.push('DashScope embedding response is not valid JSON');
+        continue;
+      }
+
+      const embedding = this.extractEmbeddingFromDashScope(parsed);
+      if (embedding) {
+        return embedding;
+      }
+      errors.push('DashScope embedding response missing embedding vector');
+    }
+
+    throw new Error(errors.join(' | ') || 'DashScope embedding failed');
+  }
+
+  private extractEmbeddingFromDashScope(response: unknown): number[] | null {
+    if (!response || typeof response !== 'object') return null;
+    const data = response as Record<string, any>;
+    const fromOutput = data.output?.embeddings?.[0]?.embedding;
+    const fromList = data.output?.embeddings?.[0]?.vector;
+    const fromData = data.data?.[0]?.embedding;
+    const candidate = fromOutput || fromList || fromData;
+    if (!Array.isArray(candidate)) return null;
+    if (!candidate.every((v) => typeof v === 'number')) return null;
+    return candidate as number[];
   }
 
   /**
