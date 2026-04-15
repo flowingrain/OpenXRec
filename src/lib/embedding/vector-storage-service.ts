@@ -15,7 +15,8 @@
  * - update_entity_embedding(): 更新实体向量
  */
 
-import { EmbeddingClient } from 'coze-coding-dev-sdk';
+import { getPgvectorDimension } from '@/lib/embedding/pgvector-config';
+import { embeddingService } from '@/lib/embedding/service';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 
 // ==================== 类型定义 ====================
@@ -49,12 +50,10 @@ interface VectorSearchResult {
  * 使用数据库原生向量列进行存储和搜索
  */
 export class VectorStorageService {
-  private embeddingClient: EmbeddingClient;
   private embeddingModel = 'doubao-embedding-vision-251215';
-  private embeddingDimensions = 2000;
 
-  constructor() {
-    this.embeddingClient = new EmbeddingClient();
+  private get embeddingDimensions(): number {
+    return getPgvectorDimension();
   }
 
   private getSupabase() {
@@ -103,7 +102,7 @@ export class VectorStorageService {
 
     try {
       // 生成向量
-      const embedding = await this.embeddingClient.embedText(content.slice(0, 8000));
+      const embedding = await embeddingService.embedText(content.slice(0, 8000), getPgvectorDimension());
       
       // 使用数据库函数更新向量
       const { error } = await supabase.rpc('update_knowledge_doc_embedding', {
@@ -158,7 +157,7 @@ export class VectorStorageService {
 
     try {
       // 生成查询向量
-      const queryVector = await this.embeddingClient.embedText(queryText);
+      const queryVector = await embeddingService.embedText(queryText, getPgvectorDimension());
 
       // 使用数据库向量搜索函数
       const { data, error } = await supabase.rpc('search_knowledge_docs', {
@@ -260,7 +259,7 @@ export class VectorStorageService {
     try {
       // 生成向量（名称 + 描述）
       const text = description ? `${name}: ${description}` : name;
-      const embedding = await this.embeddingClient.embedText(text.slice(0, 2000));
+      const embedding = await embeddingService.embedText(text.slice(0, 2000), getPgvectorDimension());
 
       // 使用数据库函数更新向量
       const { error } = await supabase.rpc('update_entity_embedding', {
@@ -315,7 +314,7 @@ export class VectorStorageService {
 
     try {
       // 生成查询向量
-      const queryVector = await this.embeddingClient.embedText(query);
+      const queryVector = await embeddingService.embedText(query, getPgvectorDimension());
 
       // 使用数据库向量搜索函数
       const { data, error } = await supabase.rpc('search_kg_entities', {
@@ -418,7 +417,7 @@ export class VectorStorageService {
 
     try {
       // 生成查询向量
-      const queryEmbedding = await this.embeddingClient.embedText(query.slice(0, 2000));
+      const queryEmbedding = await embeddingService.embedText(query.slice(0, 2000), getPgvectorDimension());
 
       // 存储到 case_embeddings 表
       const { error } = await supabase
@@ -439,7 +438,7 @@ export class VectorStorageService {
 
       // 如果有结论，也生成向量
       if (conclusion && conclusion.length > 50) {
-        const conclusionEmbedding = await this.embeddingClient.embedText(conclusion.slice(0, 2000));
+        const conclusionEmbedding = await embeddingService.embedText(conclusion.slice(0, 2000), getPgvectorDimension());
         
         await supabase
           .from('case_embeddings')
@@ -478,7 +477,7 @@ export class VectorStorageService {
 
     try {
       // 生成查询向量
-      const queryVector = await this.embeddingClient.embedText(query);
+      const queryVector = await embeddingService.embedText(query, getPgvectorDimension());
 
       // 尝试使用数据库函数
       const { data, error } = await supabase.rpc('search_analysis_cases', {

@@ -1,3 +1,5 @@
+import { isLabVllmLlmConfigured } from '@/lib/runtime/openxrec-runtime';
+
 /**
  * 解析当前应使用的聊天模型 ID（Coze 豆包 / DeepSeek OpenAPI 兼容等）。
  */
@@ -10,6 +12,10 @@ export function isDeepSeekConfigured(): boolean {
  */
 export function getChatModelId(callerModel?: string): string {
   const c = callerModel?.trim();
+  if (isLabVllmLlmConfigured()) {
+    if (c && !c.startsWith('doubao-')) return c;
+    return (process.env.OPENXREC_LAB_LLM_MODEL || '').trim();
+  }
   if (isDeepSeekConfigured()) {
     if (c && !c.startsWith('doubao-')) return c;
     return (process.env.DEEPSEEK_MODEL || process.env.LLM_MODEL || 'deepseek-chat').trim();

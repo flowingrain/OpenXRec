@@ -16,7 +16,7 @@
  *   pnpm db:sql-bundle
  *   将生成的 supabase/migrate-all-for-sql-editor.sql 粘贴到 Dashboard → SQL Editor → Run
  *
- * 首个文件 000_pre_vector_cleanup.sql 会 DROP 向量索引并将旧 vector 列规范为 2000 维，便于重复执行。
+ * 首个文件 000_pre_vector_cleanup.sql 会 DROP 向量索引并将旧 vector 列规范为 1024 维，便于重复执行。
  */
 
 import dns from 'node:dns';

@@ -9,7 +9,18 @@
  */
 
 import { Config, EmbeddingClient } from 'coze-coding-dev-sdk';
+import {
+  getLabEmbeddingTimeoutMs,
+  isLabVllmEmbeddingConfigured,
+} from '@/lib/runtime/openxrec-runtime';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { getPgvectorDimension, normalizeEmbeddingForStorage } from '@/lib/embedding/pgvector-config';
+
+function openAiEmbeddingsRequestUrl(baseRaw: string): string {
+  const base = baseRaw.trim().replace(/\/$/, '');
+  if (base.endsWith('/v1')) return `${base}/embeddings`;
+  return `${base}/v1/embeddings`;
+}
 
 // ==================== 类型定义 ====================
 
@@ -124,7 +135,6 @@ export class EmbeddingService {
     process.env.EmbeddingService_BASE_URL?.trim() ||
     'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
   private embeddingModel = 'doubao-embedding-vision-251215';
-  private embeddingDimensions = 2000;
   private cozeEmbeddingDisabled = false;
   private warnedCozeEmbeddingUnavailable = false;
 
@@ -146,30 +156,83 @@ export class EmbeddingService {
 
   /**
    * 获取文本嵌入向量
+   * 输出长度与 `OPENXREC_PGVECTOR_DIMENSION`（默认 1024）对齐；Qwen 全维输出会按 MRL 取前 N 维。
    */
   async embedText(text: string, dimensions?: number): Promise<number[]> {
-    if (this.dashScopeApiKey) {
-      return this.embedTextByDashScope(text, dimensions);
-    }
+    const targetDim =
+      dimensions && dimensions > 0
+        ? Math.min(dimensions, getPgvectorDimension())
+        : getPgvectorDimension();
 
-    if (this.cozeEmbeddingDisabled || !this.cozeClient) {
+    let raw: number[];
+    if (isLabVllmEmbeddingConfigured()) {
+      raw = await this.embedTextByLabVllmOpenAI(text);
+    } else if (this.dashScopeApiKey) {
+      raw = await this.embedTextByDashScope(text, targetDim);
+    } else if (this.cozeEmbeddingDisabled || !this.cozeClient) {
       throw new Error('No embedding provider available');
+    } else {
+      try {
+        raw = await this.cozeClient.embedText(text, { dimensions: targetDim });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || '');
+        if (message.toLowerCase().includes('invalid url') || message.toLowerCase().includes('networkerror')) {
+          this.cozeEmbeddingDisabled = true;
+          if (!this.warnedCozeEmbeddingUnavailable) {
+            this.warnedCozeEmbeddingUnavailable = true;
+            console.warn(
+              '[EmbeddingService] Coze Embedding unavailable in local runtime. Set EmbeddingService_API_KEY to use DashScope embedding.'
+            );
+          }
+        }
+        throw error;
+      }
     }
 
+    return normalizeEmbeddingForStorage(raw, targetDim);
+  }
+
+  /**
+   * 实验室 vLLM 向量服务（OpenAI 兼容 /v1/embeddings），如 SSH 隧道到 8011。
+   * 返回原始向量，由 embedText 按 OPENXREC_PGVECTOR_DIMENSION 截断（如 Qwen 2560 -> 1024）。
+   */
+  private async embedTextByLabVllmOpenAI(text: string): Promise<number[]> {
+    const baseRaw = process.env.OPENXREC_LAB_EMBEDDING_BASE_URL?.trim();
+    const apiKey = process.env.OPENXREC_LAB_EMBEDDING_API_KEY?.trim();
+    const model = process.env.OPENXREC_LAB_EMBEDDING_MODEL?.trim();
+    if (!baseRaw || !apiKey || !model) {
+      throw new Error('Lab embedding env OPENXREC_LAB_EMBEDDING_* is incomplete');
+    }
+    const url = openAiEmbeddingsRequestUrl(baseRaw);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), getLabEmbeddingTimeoutMs());
     try {
-      return await this.cozeClient.embedText(text, dimensions ? { dimensions } : undefined);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error || '');
-      if (message.toLowerCase().includes('invalid url') || message.toLowerCase().includes('networkerror')) {
-        this.cozeEmbeddingDisabled = true;
-        if (!this.warnedCozeEmbeddingUnavailable) {
-          this.warnedCozeEmbeddingUnavailable = true;
-          console.warn(
-            '[EmbeddingService] Coze Embedding unavailable in local runtime. Set EmbeddingService_API_KEY to use DashScope embedding.'
-          );
-        }
+      const response = await fetch(url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model, input: text }),
+      });
+      const raw = await response.text();
+      if (!response.ok) {
+        throw new Error(`Lab embedding ${response.status}: ${raw.slice(0, 800)}`);
       }
-      throw error;
+      let parsed: { data?: Array<{ embedding?: number[] }> };
+      try {
+        parsed = JSON.parse(raw) as typeof parsed;
+      } catch {
+        throw new Error('Lab embedding response is not valid JSON');
+      }
+      const embedding = parsed.data?.[0]?.embedding;
+      if (!Array.isArray(embedding) || !embedding.every((v) => typeof v === 'number')) {
+        throw new Error('Lab embedding response missing data[0].embedding');
+      }
+      return embedding;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -317,7 +380,7 @@ export class EmbeddingService {
 
     try {
       // 获取查询向量
-      const queryEmbedding = await this.embedText(query, this.embeddingDimensions);
+      const queryEmbedding = await this.embedText(query, getPgvectorDimension());
       
       // 尝试使用 RPC 函数进行向量搜索
       const { data: vectorResults, error } = await supabase.rpc('search_knowledge_docs', {
@@ -414,7 +477,7 @@ export class EmbeddingService {
 
     try {
       // 获取查询向量
-      const queryEmbedding = await this.embedText(topic, this.embeddingDimensions);
+      const queryEmbedding = await this.embedText(topic, getPgvectorDimension());
       
       // 尝试使用 RPC 函数进行向量搜索
       const { data: vectorResults, error } = await supabase.rpc('search_analysis_cases', {
@@ -505,7 +568,7 @@ export class EmbeddingService {
 
     try {
       // 获取查询向量
-      const queryEmbedding = await this.embedText(keyword, this.embeddingDimensions);
+      const queryEmbedding = await this.embedText(keyword, getPgvectorDimension());
       
       // 尝试使用 RPC 函数进行向量搜索
       const { data: vectorResults, error } = await supabase.rpc('search_kg_entities', {
@@ -601,7 +664,7 @@ export class EmbeddingService {
 
     try {
       // 生成嵌入向量
-      const embedding = await this.embedText(content.slice(0, 8000), this.embeddingDimensions);
+      const embedding = await this.embedText(content.slice(0, 8000), getPgvectorDimension());
       
       // 使用 RPC 函数更新嵌入
       const { error } = await supabase.rpc('update_knowledge_doc_embedding', {
@@ -657,7 +720,7 @@ export class EmbeddingService {
     try {
       // 合并名称和描述作为嵌入文本
       const text = description ? `${name}: ${description}` : name;
-      const embedding = await this.embedText(text.slice(0, 2000), this.embeddingDimensions);
+      const embedding = await this.embedText(text.slice(0, 2000), getPgvectorDimension());
       
       // 尝试使用 RPC 函数
       const { error } = await supabase.rpc('update_entity_embedding', {

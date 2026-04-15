@@ -180,6 +180,32 @@ pnpm build
 pnpm start
 ```
 
+### 数据库迁移（Supabase）
+
+推荐与知识向量等能力依赖 Postgres（含 **pgvector**）。匿名 API 密钥不能执行 DDL，需要在 `.env.local` 中配置**数据库直连**（任选其一）：
+
+- `SUPABASE_DB_URL=postgresql://postgres:数据库密码@db.xxx.supabase.co:5432/postgres`
+- 或 `DATABASE_URL=…`（同上含义）
+
+连接串在 Supabase Dashboard → **Project Settings** → **Database** → **Connection string**（URI）中复制，将 `[YOUR-PASSWORD]` 换成项目的数据库密码。
+
+在项目根目录执行：
+
+```bash
+pnpm db:migrate
+```
+
+脚本会按顺序执行 `supabase/migrations/000_pre_vector_cleanup.sql`、`supabase/init.sql` 及 `002`–`006` 迁移（定义见 `scripts/supabase-sql-sources.ts`）。策略与触发器在重复执行前会先 `DROP … IF EXISTS`，便于在同一库上多次跑迁移。
+
+若本机无法稳定直连数据库（超时、被断开），可生成合并 SQL 后在控制台执行：
+
+```bash
+pnpm db:sql-bundle
+# 将生成的 supabase/migrate-all-for-sql-editor.sql 粘贴到 Dashboard → SQL Editor → Run
+```
+
+**向量维度**：表结构与嵌入维度需一致；若更换嵌入模型维度，请同步调整迁移中的 `vector(n)` / 相关索引，并在 `.env.example` 中查阅 `OPENXREC_PGVECTOR_DIMENSION` 的说明后配置到 `.env.local`。
+
 ### API 使用示例
 
 ```bash
