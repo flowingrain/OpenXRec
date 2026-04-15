@@ -9,4 +9,5 @@ export const SUPABASE_SQL_MIGRATION_FILES = [
   'supabase/migrations/004_recommendation_infrastructure.sql',
   'supabase/migrations/005_add_pgvector_optimization.sql',
   'supabase/migrations/006_ppo_persistence.sql',
+  'supabase/migrations/007_session_memories.sql',
 ] as const;

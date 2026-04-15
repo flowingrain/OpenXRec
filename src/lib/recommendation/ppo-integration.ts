@@ -68,10 +68,23 @@ export interface RecommendationSession {
  * 策略优化配置
  */
 export interface PolicyOptimizationConfig {
-  // 训练触发条件
-  minSamplesForTraining: number;      // 最小样本数
-  trainingIntervalMs: number;         // 训练间隔（毫秒）
-  
+  /** 自上次训练以来至少积累多少条用户反馈事件后才允许再次训练（避免每条反馈都触发） */
+  minFeedbackEventsBeforeTrain: number;
+  /**
+   * 两次训练之间的最短间隔（毫秒）。
+   * 兼容旧字段名 `trainingIntervalMs`（若传入 Partial 配置且未设 cooldown，会回退到 trainingIntervalMs）。
+   */
+  trainingCooldownMs: number;
+  /** @deprecated 请使用 trainingCooldownMs；仍会在合并配置时作为 cooldown 的兜底 */
+  trainingIntervalMs?: number;
+
+  /** 完整训练：会话对样本数下限（与 generateTrainingSamples 长度一致，约为 sessionBuffer.length - 1） */
+  minSamplesForTraining: number;
+  /** 轻量（部分）训练：样本数下限，低于完整训练门槛，用于先小幅更新策略 */
+  minSessionPairsForPartial: number;
+  partialTrainEpochs: number;
+  partialTrainBatchSize: number;
+
   // 奖励计算
   rewardWeights: {
     click: number;
@@ -93,8 +106,12 @@ export interface PolicyOptimizationConfig {
  * 默认策略优化配置
  */
 export const DEFAULT_POLICY_OPTIMIZATION_CONFIG: PolicyOptimizationConfig = {
+  minFeedbackEventsBeforeTrain: 32,
+  trainingCooldownMs: 3600000, // 1 小时：控制训练频率上限
   minSamplesForTraining: 256,
-  trainingIntervalMs: 3600000, // 1小时
+  minSessionPairsForPartial: 64,
+  partialTrainEpochs: 2,
+  partialTrainBatchSize: 32,
   rewardWeights: {
     click: 1.0,
     like: 2.0,
@@ -107,6 +124,67 @@ export const DEFAULT_POLICY_OPTIMIZATION_CONFIG: PolicyOptimizationConfig = {
   autoTrain: true,
 };
 
+function mergePolicyOptimizationConfig(
+  partial: Partial<PolicyOptimizationConfig> = {}
+): PolicyOptimizationConfig {
+  const base = DEFAULT_POLICY_OPTIMIZATION_CONFIG;
+  const cooldown =
+    partial.trainingCooldownMs ??
+    partial.trainingIntervalMs ??
+    base.trainingCooldownMs;
+  return {
+    ...base,
+    ...partial,
+    trainingCooldownMs: cooldown,
+    rewardWeights: { ...base.rewardWeights, ...partial.rewardWeights },
+  };
+}
+
+/**
+ * 从环境变量读取 PPO 策略服务配置（可选覆盖默认值）。
+ * 用于「积累反馈后再训练」「轻量更新 vs 完整训练」等行为调参。
+ */
+export function policyOptimizationConfigFromEnv(): Partial<PolicyOptimizationConfig> {
+  const num = (key: string): number | undefined => {
+    const raw = process.env[key];
+    if (raw === undefined || raw === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const bool = (key: string): boolean | undefined => {
+    const raw = process.env[key];
+    if (raw === undefined || raw === '') return undefined;
+    const v = raw.toLowerCase();
+    if (v === '1' || v === 'true' || v === 'yes') return true;
+    if (v === '0' || v === 'false' || v === 'no') return false;
+    return undefined;
+  };
+
+  const out: Partial<PolicyOptimizationConfig> = {};
+  const minFb = num('OPENXREC_PPO_MIN_FEEDBACKS_BEFORE_TRAIN');
+  if (minFb !== undefined) out.minFeedbackEventsBeforeTrain = minFb;
+
+  const cooldown = num('OPENXREC_PPO_TRAINING_COOLDOWN_MS');
+  if (cooldown !== undefined) out.trainingCooldownMs = cooldown;
+
+  const minPartial = num('OPENXREC_PPO_MIN_SESSION_PAIRS_PARTIAL');
+  if (minPartial !== undefined) out.minSessionPairsForPartial = minPartial;
+
+  const minFull = num('OPENXREC_PPO_MIN_SESSION_PAIRS_FULL');
+  if (minFull !== undefined) out.minSamplesForTraining = minFull;
+
+  const pe = num('OPENXREC_PPO_PARTIAL_EPOCHS');
+  if (pe !== undefined) out.partialTrainEpochs = pe;
+
+  const pb = num('OPENXREC_PPO_PARTIAL_BATCH_SIZE');
+  if (pb !== undefined) out.partialTrainBatchSize = pb;
+
+  const auto = bool('OPENXREC_PPO_AUTO_TRAIN');
+  if (auto !== undefined) out.autoTrain = auto;
+
+  return out;
+}
+
 /**
  * 策略优化状态
  */
@@ -114,8 +192,11 @@ export interface PolicyOptimizationState {
   // 统计信息
   totalSessions: number;
   totalFeedbacks: number;
+  /** 自上次训练起累计的反馈条数（训练成功后清零） */
+  feedbackEventsSinceLastTrain: number;
   lastTrainingTime: number;
   trainingCount: number;
+  lastTrainMode: 'full' | 'partial' | null;
   
   // 当前最优策略
   bestPolicy: StrategyWeights | null;
@@ -152,29 +233,35 @@ export class PPOPolicyOptimizationService {
   
   // 训练定时器
   private trainingTimer: NodeJS.Timeout | null = null;
+  private isTraining = false;
 
   constructor(
     adaptiveOptimizer: AdaptiveOptimizerAgent,
     config: Partial<PolicyOptimizationConfig> = {}
   ) {
     this.adaptiveOptimizer = adaptiveOptimizer;
-    this.config = { ...DEFAULT_POLICY_OPTIMIZATION_CONFIG, ...config };
+    this.config = mergePolicyOptimizationConfig(config);
     
-    // 创建PPO优化器
+    // 创建PPO优化器（minSamples 取轻量/完整门槛中较小者，否则样本不足时无法 trainWithConfig）
     this.ppoOptimizer = createPPOOptimizer({
       stateDim: 32,
       hiddenDims: [128, 64, 32],
       learningRate: this.config.learningRate,
       bufferSize: 10000,
-      minSamples: this.config.minSamplesForTraining,
+      minSamples: Math.min(
+        this.config.minSessionPairsForPartial,
+        this.config.minSamplesForTraining
+      ),
     });
     
     // 初始化状态
     this.state = {
       totalSessions: 0,
       totalFeedbacks: 0,
+      feedbackEventsSinceLastTrain: 0,
       lastTrainingTime: 0,
       trainingCount: 0,
+      lastTrainMode: null,
       bestPolicy: null,
       bestReward: 0,
       trainingHistory: [],
@@ -221,16 +308,13 @@ export class PPOPolicyOptimizationService {
     
     session.feedbacks.push(feedback);
     this.state.totalFeedbacks++;
+    this.state.feedbackEventsSinceLastTrain++;
     
     // 同步到自适应优化智能体
     this.syncToAdaptiveOptimizer(feedback);
     
-    // 检查是否需要触发训练
-    if (this.shouldTrain()) {
-      this.train().catch(err => {
-        console.error('[PPOService] Training failed:', err);
-      });
-    }
+    // 满足「积累 + 冷却 + 样本档」后再异步训练，避免每条反馈触发完整训练
+    this.tryScheduleTraining();
   }
 
   /**
@@ -241,41 +325,67 @@ export class PPOPolicyOptimizationService {
   }
 
   /**
-   * 手动触发训练
+   * 触发一次训练（仅校验当前模式下的样本量是否足够）。
+   * 反馈积累与冷却由 `evaluateTrainOpportunity` 在自动路径上控制；手动/API 可在此直接调用。
+   * - `mode: 'full'`：完整门槛，默认 epoch/batch
+   * - `mode: 'partial'`：轻量门槛，较少 epoch
    */
-  async train(): Promise<{
+  async train(options?: {
+    mode?: 'full' | 'partial';
+  }): Promise<{
     success: boolean;
     metrics?: {
       policyLoss: number;
       valueLoss: number;
       avgReward: number;
       improvement: number;
+      mode: 'full' | 'partial';
     };
     error?: string;
   }> {
+    let mode = options?.mode;
+
+    if (!mode) {
+      const pairs = this.getSessionPairCount();
+      if (pairs >= this.config.minSamplesForTraining) mode = 'full';
+      else if (pairs >= this.config.minSessionPairsForPartial) mode = 'partial';
+      else mode = 'full';
+    }
+
+    const minPairs =
+      mode === 'full'
+        ? this.config.minSamplesForTraining
+        : this.config.minSessionPairsForPartial;
+
     const samples = this.generateTrainingSamples();
-    
-    if (samples.length < this.config.minSamplesForTraining) {
+
+    if (samples.length < minPairs) {
       return {
         success: false,
-        error: `Insufficient samples: ${samples.length} < ${this.config.minSamplesForTraining}`,
+        error: `Insufficient samples for ${mode}: ${samples.length} < ${minPairs}`,
       };
     }
-    
+
     try {
-      console.log(`[PPOService] Starting training with ${samples.length} samples...`);
-      
-      // 存储经验
+      console.log(
+        `[PPOService] Starting ${mode} training with ${samples.length} session-pair samples...`
+      );
+
       this.ppoOptimizer.storeExperiencesBatch(samples);
-      
-      // 训练
-      const result = await this.ppoOptimizer.trainWithConfig();
-      
-      // 更新状态
+
+      const result =
+        mode === 'full'
+          ? await this.ppoOptimizer.trainWithConfig()
+          : await this.ppoOptimizer.trainWithConfig(
+              this.config.partialTrainEpochs,
+              this.config.partialTrainBatchSize
+            );
+
       this.state.lastTrainingTime = Date.now();
       this.state.trainingCount++;
-      
-      // 更新最优策略
+      this.state.feedbackEventsSinceLastTrain = 0;
+      this.state.lastTrainMode = mode;
+
       if (result.avgReward > this.state.bestReward) {
         this.state.bestReward = result.avgReward;
         this.state.bestPolicy = this.ppoOptimizer.getAction(
@@ -283,8 +393,7 @@ export class PPOPolicyOptimizationService {
           true
         ).action.strategyWeights;
       }
-      
-      // 记录历史
+
       this.state.trainingHistory.push({
         timestamp: Date.now(),
         policyLoss: result.policyLoss,
@@ -292,14 +401,15 @@ export class PPOPolicyOptimizationService {
         avgReward: result.avgReward,
         improvement: result.improvement,
       });
-      
-      // 保持历史记录在合理范围
+
       if (this.state.trainingHistory.length > 100) {
         this.state.trainingHistory = this.state.trainingHistory.slice(-100);
       }
-      
-      console.log(`[PPOService] Training complete: policyLoss=${result.policyLoss.toFixed(4)}, improvement=${result.improvement.toFixed(4)}`);
-      
+
+      console.log(
+        `[PPOService] ${mode} training complete: policyLoss=${result.policyLoss.toFixed(4)}, improvement=${result.improvement.toFixed(4)}`
+      );
+
       return {
         success: true,
         metrics: {
@@ -307,6 +417,7 @@ export class PPOPolicyOptimizationService {
           valueLoss: result.valueLoss,
           avgReward: result.avgReward,
           improvement: result.improvement,
+          mode,
         },
       };
     } catch (error) {
@@ -326,6 +437,23 @@ export class PPOPolicyOptimizationService {
       ...this.state,
       bufferSize: this.ppoOptimizer.getBufferSize(),
     };
+  }
+
+  /**
+   * 与 `/api/recommendation/ppo`、反馈闭环共用同一套策略网络与经验回放（单例）。
+   */
+  getPPOOptimizer(): PPOOptimizer {
+    return this.ppoOptimizer;
+  }
+
+  /**
+   * 当前 PPO 优化器在 train/trainWithConfig 中使用的最小回放样本数（与创建时 minSamples 一致）。
+   */
+  getPpoReplayMinSamples(): number {
+    return Math.min(
+      this.config.minSessionPairsForPartial,
+      this.config.minSamplesForTraining
+    );
   }
 
   /**
@@ -446,30 +574,65 @@ export class PPOPolicyOptimizationService {
     });
   }
 
-  /**
-   * 检查是否应该训练
-   */
-  private shouldTrain(): boolean {
-    const now = Date.now();
-    const timeSinceLastTraining = now - this.state.lastTrainingTime;
-    const hasEnoughSamples = this.sessionBuffer.length >= this.config.minSamplesForTraining;
-    
-    return hasEnoughSamples && timeSinceLastTraining >= this.config.trainingIntervalMs;
+  private getSessionPairCount(): number {
+    return Math.max(0, this.sessionBuffer.length - 1);
   }
 
   /**
-   * 启动自动训练
+   * 是否满足自动训练条件（积累反馈 + 冷却 + 样本档位）。
+   * 样本足够完整训练时优先完整训练，否则在达到轻量门槛时做 partial。
+   */
+  private evaluateTrainOpportunity(): { mode: 'full' | 'partial' } | null {
+    if (!this.config.autoTrain || this.isTraining) return null;
+
+    const now = Date.now();
+    if (
+      this.state.lastTrainingTime > 0 &&
+      now - this.state.lastTrainingTime < this.config.trainingCooldownMs
+    ) {
+      return null;
+    }
+
+    if (this.state.feedbackEventsSinceLastTrain < this.config.minFeedbackEventsBeforeTrain) {
+      return null;
+    }
+
+    const pairs = this.getSessionPairCount();
+    if (pairs >= this.config.minSamplesForTraining) {
+      return { mode: 'full' };
+    }
+    if (pairs >= this.config.minSessionPairsForPartial) {
+      return { mode: 'partial' };
+    }
+    return null;
+  }
+
+  private tryScheduleTraining(): void {
+    const plan = this.evaluateTrainOpportunity();
+    if (!plan || this.isTraining) return;
+
+    this.isTraining = true;
+    this.train({ mode: plan.mode })
+      .catch(err => {
+        console.error('[PPOService] Training failed:', err);
+      })
+      .finally(() => {
+        this.isTraining = false;
+      });
+  }
+
+  /**
+   * 启动自动训练（轮询检查条件，间隔独立于冷却时间）
    */
   private startAutoTraining(): void {
+    const pollMs = Math.min(60_000, Math.max(15_000, this.config.trainingCooldownMs / 4));
     this.trainingTimer = setInterval(() => {
-      if (this.shouldTrain()) {
-        this.train().catch(err => {
-          console.error('[PPOService] Auto training failed:', err);
-        });
-      }
-    }, this.config.trainingIntervalMs);
-    
-    console.log(`[PPOService] Auto training started, interval: ${this.config.trainingIntervalMs}ms`);
+      this.tryScheduleTraining();
+    }, pollMs);
+
+    console.log(
+      `[PPOService] Auto training poll every ${pollMs}ms, cooldown ${this.config.trainingCooldownMs}ms`
+    );
   }
 }
 
@@ -487,9 +650,20 @@ export function getPPOPolicyService(
 ): PPOPolicyOptimizationService {
   if (!ppoServiceInstance) {
     const optimizer = adaptiveOptimizer || new AdaptiveOptimizerAgent({} as any);
-    ppoServiceInstance = new PPOPolicyOptimizationService(optimizer);
+    ppoServiceInstance = new PPOPolicyOptimizationService(
+      optimizer,
+      policyOptimizationConfigFromEnv()
+    );
   }
   return ppoServiceInstance;
+}
+
+/**
+ * 全局共享的 `PPOOptimizer`，与 `getPPOPolicyService().getPPOOptimizer()` 为同一实例。
+ * 供 HTTP 路由等与反馈闭环对齐，避免两套独立权重。
+ */
+export function getSharedPPOOptimizer(): PPOOptimizer {
+  return getPPOPolicyService().getPPOOptimizer();
 }
 
 /**
@@ -499,5 +673,8 @@ export function createPPOPolicyService(
   adaptiveOptimizer: AdaptiveOptimizerAgent,
   config?: Partial<PolicyOptimizationConfig>
 ): PPOPolicyOptimizationService {
-  return new PPOPolicyOptimizationService(adaptiveOptimizer, config);
+  return new PPOPolicyOptimizationService(adaptiveOptimizer, {
+    ...policyOptimizationConfigFromEnv(),
+    ...config,
+  });
 }

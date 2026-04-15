@@ -55,6 +55,14 @@ export interface ChatMessage {
  */
 type FeedbackType = 'question' | 'correction' | 'supplement' | 'deep_dive' | 'rerun';
 
+type RecommendationFeedbackContext = {
+  userId: string;
+  itemId: string;
+  strategy?: string;
+  position?: number;
+  explanationType?: string;
+};
+
 /**
  * 聊天面板属性
  */
@@ -67,8 +75,15 @@ export interface ChatPanelProps {
     keyFactors?: any[];
     scenarios?: any[];
     finalReport?: string;
+    userId?: string;
+    itemId?: string;
+    strategy?: string;
+    position?: number;
+    explanationType?: string;
   };
   caseId?: string | null;  // 案例ID，用于存储反馈
+  /** 推荐多轮会话时传入：将随 /api/chat-feedback 一并上送 */
+  recommendationContext?: RecommendationFeedbackContext;
   onReanalysis?: (targetNode: string) => void;
   className?: string;
   defaultExpanded?: boolean;
@@ -80,6 +95,7 @@ export interface ChatPanelProps {
 export function ChatPanel({
   analysisContext,
   caseId,
+  recommendationContext,
   onReanalysis,
   className,
   defaultExpanded = true
@@ -96,6 +112,39 @@ export function ChatPanel({
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const inferRecommendationPolarity = (
+    text: string
+  ): 'like' | 'dislike' | undefined => {
+    const t = text.trim();
+    if (!t) return undefined;
+    if (/(同意|认可|没问题|正确|有帮助|赞同|靠谱|满意|喜欢)/.test(t)) return 'like';
+    if (/(不同意|反对|不认可|不相关|没帮助|离题|不满意|差评|不喜欢)/.test(t)) return 'dislike';
+    return undefined;
+  };
+
+  const resolveRecommendationContext = (): RecommendationFeedbackContext | undefined => {
+    if (recommendationContext?.userId && recommendationContext?.itemId) {
+      return recommendationContext;
+    }
+
+    if (analysisContext?.userId && analysisContext?.itemId) {
+      return {
+        userId: String(analysisContext.userId),
+        itemId: String(analysisContext.itemId),
+        strategy: analysisContext.strategy ? String(analysisContext.strategy) : undefined,
+        position:
+          typeof analysisContext.position === 'number'
+            ? analysisContext.position
+            : undefined,
+        explanationType: analysisContext.explanationType
+          ? String(analysisContext.explanationType)
+          : undefined,
+      };
+    }
+
+    return undefined;
+  };
   
   // 自动滚动到底部
   useEffect(() => {
@@ -121,6 +170,9 @@ export function ChatPanel({
     setFeedbackInfo(null);
     
     try {
+      const recContext = resolveRecommendationContext();
+      const inferredPolarity = inferRecommendationPolarity(userMessage.content);
+
       // 调用 Chat 智能体 API
       const response = await fetch('/api/chat-feedback', {
         method: 'POST',
@@ -129,7 +181,11 @@ export function ChatPanel({
           message: userMessage.content,
           caseId,  // 传递案例ID用于存储反馈
           analysisContext,
-          chatHistory: messages
+          chatHistory: messages,
+          ...(recContext ? { recommendationContext: recContext } : {}),
+          ...(recContext && inferredPolarity
+            ? { recommendationPolarity: inferredPolarity }
+            : {}),
         })
       });
       

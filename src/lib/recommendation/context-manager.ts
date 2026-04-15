@@ -16,6 +16,7 @@
 
 import { LLMClient } from 'coze-coding-dev-sdk';
 import { createClient } from '@supabase/supabase-js';
+import { createLLMClient } from '@/lib/llm/create-llm-client';
 import { 
   PPOContextExtension, 
   getPPOContextExtension,
@@ -103,11 +104,15 @@ export interface SessionMemory {
 export interface ContextManagerConfig {
   // 短期记忆限制
   maxRecentMessages: number;        // 保留最近N条完整消息（默认10）
-  maxContextTokens: number;         // 最大上下文Token数（默认8000）
+  /** 供服务端估算与压缩触发：接近该预算时尝试摘要（非精确 tokenizer） */
+  maxContextTokens: number;         // 默认8000
   
-  // 压缩配置
-  compressionThreshold: number;     // 触发压缩的消息数阈值（默认20）
-  compressionRatio: number;         // 压缩比例（默认0.3）
+  // 压缩配置（按「估算 token 占满预算」触发，而非固定条数）
+  /** 当估算 token ≥ maxContextTokens × 该比例时触发压缩（默认 0.88） */
+  compressAtTokenRatio: number;
+  /** @deprecated 不再作为触发条件；保留仅为兼容旧配置 */
+  compressionThreshold?: number;
+  compressionRatio: number;         // 保留字段；摘要提示仍可用
   
   // 长期记忆
   enableLongTermMemory: boolean;    // 启用长期记忆
@@ -126,7 +131,7 @@ export interface ContextManagerConfig {
 const DEFAULT_CONFIG: ContextManagerConfig = {
   maxRecentMessages: 10,
   maxContextTokens: 8000,
-  compressionThreshold: 20,
+  compressAtTokenRatio: 0.88,
   compressionRatio: 0.3,
   enableLongTermMemory: true,
   maxKeyFacts: 20,
@@ -154,7 +159,7 @@ export class ContextManager {
 
   constructor(config: Partial<ContextManagerConfig> = {}, llmClient?: LLMClient) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.llmClient = llmClient || new LLMClient();
+    this.llmClient = llmClient ?? (createLLMClient({}) as unknown as LLMClient);
     
     // 初始化 PPO 扩展
     this.ppoExtension = getPPOContextExtension({
@@ -297,6 +302,48 @@ export class ContextManager {
   }
 
   // ===========================================================================
+  // 估算与压缩触发（供服务端；非展示用）
+  // ===========================================================================
+
+  /** 与 getContextForLLM 拼接一致，粗估 token ≈ ceil(chars/4) */
+  private buildContextStringForEstimate(session: SessionMemory): string {
+    const parts: string[] = [];
+    if (session.compressedContext) {
+      parts.push(`【历史对话摘要】\n${session.compressedContext.summary}`);
+      if (session.compressedContext.keyFacts.length > 0) {
+        parts.push(`\n【关键事实】\n${session.compressedContext.keyFacts.map((f) => `- ${f}`).join('\n')}`);
+      }
+      if (session.compressedContext.userPreferences.length > 0) {
+        parts.push(`\n【用户偏好】\n${session.compressedContext.userPreferences.map((p) => `- ${p}`).join('\n')}`);
+      }
+    }
+    const recentMessages = session.messages.slice(-this.config.maxRecentMessages);
+    if (recentMessages.length > 0) {
+      parts.push(
+        `\n【最近对话】\n${recentMessages
+          .map((m) => `${m.role === 'user' ? '用户' : '助手'}: ${m.content}`)
+          .join('\n\n')}`
+      );
+    }
+    return parts.join('\n');
+  }
+
+  private estimateContextTokens(session: SessionMemory): number {
+    const text = this.buildContextStringForEstimate(session);
+    return Math.max(1, Math.ceil(text.length / 4));
+  }
+
+  /** 仅在估算接近 maxContextTokens 时压缩；不达到预算不压 */
+  private async maybeCompressAfterMutation(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.messages.length < 2) return;
+    const ratio = this.config.compressAtTokenRatio ?? 0.88;
+    const budget = this.config.maxContextTokens;
+    if (this.estimateContextTokens(session) < budget * ratio) return;
+    await this.compressContext(sessionId);
+  }
+
+  // ===========================================================================
   // 核心方法：消息管理
   // ===========================================================================
 
@@ -322,12 +369,9 @@ export class ContextManager {
     session.messages.push(message);
     session.metadata.messageCount++;
     session.metadata.updatedAt = Date.now();
-    
-    // 检查是否需要压缩
-    if (session.messages.length >= this.config.compressionThreshold) {
-      await this.compressContext(sessionId);
-    }
-    
+
+    await this.maybeCompressAfterMutation(sessionId);
+
     await this.persistSession(session);
   }
 
@@ -353,7 +397,9 @@ export class ContextManager {
     session.messages.push(message);
     session.metadata.messageCount++;
     session.metadata.updatedAt = Date.now();
-    
+
+    await this.maybeCompressAfterMutation(sessionId);
+
     await this.persistSession(session);
   }
 
@@ -430,17 +476,29 @@ export class ContextManager {
    */
   async compressContext(sessionId: string): Promise<CompressedContext | null> {
     const session = this.sessions.get(sessionId);
-    if (!session || session.messages.length < this.config.compressionThreshold) {
+    if (!session || session.messages.length < 2) {
       return null;
     }
-    
+
     console.log(`[ContextManager] Compressing context for session ${sessionId}`);
-    
-    // 保留最近N条消息
-    const recentMessages = session.messages.slice(-this.config.maxRecentMessages);
-    const toCompress = session.messages.slice(0, -this.config.maxRecentMessages);
-    
-    if (toCompress.length === 0) return null;
+
+    const maxR = this.config.maxRecentMessages;
+    let recentMessages = session.messages.slice(-maxR);
+    let toCompress = session.messages.slice(0, -maxR);
+
+    // 条数未超过「最近窗口」但总字数已需压缩：保留末尾至少 2 条，前面并入摘要
+    if (toCompress.length === 0) {
+      const keep = Math.min(maxR, Math.max(2, session.messages.length - 1));
+      if (session.messages.length <= keep) {
+        return null;
+      }
+      recentMessages = session.messages.slice(-keep);
+      toCompress = session.messages.slice(0, -keep);
+    }
+
+    if (toCompress.length === 0) {
+      return null;
+    }
     
     try {
       // 使用LLM进行压缩
@@ -596,6 +654,7 @@ ${toCompress.map(m => `${m.role === 'user' ? '用户' : '助手'}: ${m.content}`
         .upsert({
           session_id: session.sessionId,
           user_id: session.userId,
+          scenario: session.scenario ?? null,
           messages: session.messages,
           compressed_context: session.compressedContext,
           metadata: session.metadata,

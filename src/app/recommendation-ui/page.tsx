@@ -107,6 +107,9 @@ export default function RecommendationPage() {
   const [knowledgeGraphRelations, setKnowledgeGraphRelations] = useState<KGRelation[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [userId] = useState('default_user');
+  const [sessionId] = useState(
+    () => `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+  );
 
   // 加载用户画像
   useEffect(() => {
@@ -205,6 +208,8 @@ export default function RecommendationPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: userMessage.content,
+          userId: sessionId,
+          sessionId,
           userProfile: {
             userId: 'default_user',
             interests: interests,

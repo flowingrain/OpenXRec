@@ -27,6 +27,11 @@ import {
   type ResponseTemplate,
   type TemplateMatchResult,
 } from './response-templates';
+import {
+  resolveTaskSchedule,
+  applyConfigToFrozenPlan,
+  normalizeAgentTaskScheduleId,
+} from './task-schedule-registry';
 
 // ============================================================================
 // 类型定义
@@ -94,6 +99,11 @@ export interface AgentServiceConfig {
   maxAgentsParallel?: number;  // 最大并行智能体数
   /** 最终返回条数上限（默认 5，API 可传入与 RECOMMENDATION_MAX_ITEMS 对齐） */
   maxReturnItems?: number;
+  /**
+   * 默认任务调度画像（可被 generateRecommendations 的 context.taskScheduleId 覆盖）。
+   * 见 task-schedule-registry。
+   */
+  defaultTaskScheduleId?: string;
 }
 
 type TaskComplexity = 'simple' | 'moderate' | 'complex';
@@ -157,6 +167,11 @@ export class AgentRecommendationService {
       userProfile?: Partial<UserProfile> | null;
       /** 会话级补充：设备、地域、上一轮追问答案等 */
       sessionHints?: string;
+      /**
+       * 固化智能体调度画像：`book` | `video` | `poi` | `shopping` | `travel` | `learning`。
+       * 显式传入时优先于自动关键词/场景匹配。
+       */
+      taskScheduleId?: string;
     }
   ): Promise<AgentRecommendationResult> {
     const startTime = Date.now();
@@ -204,8 +219,26 @@ export class AgentRecommendationService {
         return comparisonResult;
       }
 
-      const executionPlan = this.planExecutionByComplexity(query, context, intentResult);
-      console.log('[AgentRecommendationService] Execution plan:', executionPlan);
+      const explicitSchedule =
+        context.taskScheduleId?.trim() || this.config.defaultTaskScheduleId?.trim();
+      const scheduleRes = resolveTaskSchedule({
+        explicitId: explicitSchedule,
+        agentSuggestedTaskScheduleId: intentResult.taskScheduleId,
+        query,
+        scenario: context.scenario,
+        intentScenarioType: intentResult.scenarioType,
+      });
+
+      const executionPlan = scheduleRes.profile
+        ? applyConfigToFrozenPlan(scheduleRes.profile.plan, {
+            skipKnowledgeGraph: this.config.skipKnowledgeGraph,
+          })
+        : this.planExecutionByComplexity(query, context, intentResult);
+
+      console.log('[AgentRecommendationService] Execution plan:', executionPlan, {
+        taskSchedule: scheduleRes.profile?.id ?? null,
+        taskScheduleSource: scheduleRes.source,
+      });
       const userSegment = this.buildUserSegmentProfile(query, context);
 
       // ========================================
@@ -349,6 +382,9 @@ export class AgentRecommendationService {
           userSegment,
           phaseTimings,
           serviceTotalMs: phaseTimings.total,
+          taskScheduleId: scheduleRes.profile?.id,
+          taskScheduleLabel: scheduleRes.profile?.label,
+          taskScheduleSource: scheduleRes.source,
         },
       };
     } catch (error) {
@@ -449,6 +485,11 @@ export class AgentRecommendationService {
     informationSufficiency: { score: number; missingFields: string[]; isSufficient: boolean };
     userIntent: string;
     confidence: number;
+    /**
+     * 推荐任务画像（用于固化智能体调度）；与 task-schedule-registry 中 ID 对齐。
+     * 无法判断时填 null。
+     */
+    taskScheduleId: string | null;
   }> {
     const prompt = `分析用户查询意图，提取关键信息。
 
@@ -465,11 +506,21 @@ export class AgentRecommendationService {
    - 特征：用户在寻找建议、推荐、选择
    - 示例："推荐几本AI书籍"、"帮我选一个咖啡机"、"哪个品牌好"
 
+**任务画像 taskScheduleId**（仅填一个枚举或 null，由你根据用户真实需求判断，不要机械套关键词）：
+- "book"：图书、阅读、书单类推荐
+- "video"：影视、综艺、流媒体内容类推荐
+- "poi"：选址、到店、线下位置、商圈相关
+- "shopping"：泛购物、选品、比价、数码家电等
+- "travel"：旅游行程、酒店景点类
+- "learning"：课程、教程、学习路径类
+- null：无法归入以上垂直、或通用闲聊式推荐
+
 请以JSON格式返回：
 {
   "scenarioType": "开店|投资|旅游|购物|学习|汽车|数码|其他",
   "recommendationType": "comparison_analysis|comparison|ranking|single",
   "queryType": "comparison_analysis|recommendation",
+  "taskScheduleId": "book|video|poi|shopping|travel|learning|null",
   "entities": [
     {"name": "实体名称", "type": "实体类型（如：汽车品牌、手机型号等）"}
   ],
@@ -496,7 +547,24 @@ export class AgentRecommendationService {
     try {
       const jsonMatch = response.content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
+        const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+        const normalized = normalizeAgentTaskScheduleId(parsed.taskScheduleId);
+        return {
+          scenarioType: typeof parsed.scenarioType === 'string' ? parsed.scenarioType : scenario || 'general',
+          recommendationType: parsed.recommendationType as any,
+          queryType: parsed.queryType as any,
+          entities: Array.isArray(parsed.entities) ? parsed.entities : [],
+          constraints: Array.isArray(parsed.constraints) ? parsed.constraints : [],
+          informationSufficiency:
+            parsed.informationSufficiency &&
+            typeof parsed.informationSufficiency === 'object' &&
+            parsed.informationSufficiency !== null
+              ? (parsed.informationSufficiency as any)
+              : { score: 0.5, missingFields: [], isSufficient: true },
+          userIntent: typeof parsed.userIntent === 'string' ? parsed.userIntent : query,
+          confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+          taskScheduleId: normalized ?? null,
+        };
       }
     } catch (e) {
       console.error('[IntentAnalyzer] Parse error:', e);
@@ -511,6 +579,7 @@ export class AgentRecommendationService {
       informationSufficiency: { score: 0.5, missingFields: [], isSufficient: true },
       userIntent: query,
       confidence: 0.5,
+      taskScheduleId: null,
     };
   }
 

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import { Button } from '@/components/ui/button';
@@ -47,6 +47,7 @@ import { AuthButton, useAuth } from '@/components/auth/LoginDialog';
 import KnowledgeBasePanel from '@/components/knowledge/KnowledgeBasePanel';
 import CasesPanel from '@/components/cases/CasesPanel';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
+import { ChatPanel } from '@/components/chat/ChatPanel';
 import type { KGEntity, KGRelation } from '@/lib/knowledge-graph/types';
 
 // 动态导入图谱组件
@@ -202,6 +203,27 @@ export default function OpenXRecHome() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  /** 最近一条含推荐结果的助手消息（主输入仍走 /api/recommendation） */
+  const lastRecMessage = useMemo(
+    () => [...messages].reverse().find((m) => m.recommendations && m.recommendations.length > 0),
+    [messages]
+  );
+  const lastUserMessage = useMemo(
+    () => [...messages].reverse().find((m) => m.role === 'user'),
+    [messages]
+  );
+  /** 与卡片展开一致：优先当前展开项，否则默认绑定列表首项，供 ChatPanel → /api/chat-feedback */
+  const chatFeedbackItemId = useMemo(() => {
+    if (!lastRecMessage?.recommendations?.length) return undefined;
+    const recs = lastRecMessage.recommendations;
+    if (expandedRecId) {
+      const match = recs.find((r, i) => (r.id || String(i)) === expandedRecId);
+      if (match) return match.id || expandedRecId;
+    }
+    const first = recs[0];
+    return first ? first.id || '0' : undefined;
+  }, [lastRecMessage, expandedRecId]);
+
   // 滚动到底部
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -296,6 +318,7 @@ export default function OpenXRecHome() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: sessionId,
+          sessionId,
           scenario: 'general',
           context: {
             query: queryText,
@@ -885,10 +908,8 @@ export default function OpenXRecHome() {
                       </div>
                     </div>
 
-                    {/* 推荐结果列表 */}
+                    {/* 推荐结果列表（与 lastRecMessage useMemo 同源） */}
                     {(() => {
-                      // 获取最近一条包含推荐的消息
-                      const lastRecMessage = [...messages].reverse().find(m => m.recommendations && m.recommendations.length > 0);
                       if (!lastRecMessage || !lastRecMessage.recommendations) return null;
                       
                       return (
@@ -1111,6 +1132,26 @@ export default function OpenXRecHome() {
                         </div>
                       );
                     })()}
+
+                    {/* 与研判页一致的 Chat 反馈入口：自然语言走 /api/chat-feedback，并带 recommendationContext 写入统一反馈桥 */}
+                    {lastRecMessage && chatFeedbackItemId && (
+                      <ChatPanel
+                        key={`${lastRecMessage.id}-${chatFeedbackItemId}`}
+                        className="mt-4 border-blue-100/80 bg-slate-50/50"
+                        defaultExpanded={false}
+                        analysisContext={{
+                          query: lastUserMessage?.content,
+                          finalReport:
+                            lastRecMessage.explanation ||
+                            lastRecMessage.content ||
+                            undefined,
+                        }}
+                        recommendationContext={{
+                          userId: sessionId,
+                          itemId: chatFeedbackItemId,
+                        }}
+                      />
+                    )}
 
                     {/* 上传文件预览 */}
                     {uploadedFiles.length > 0 && (

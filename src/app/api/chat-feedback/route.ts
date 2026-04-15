@@ -8,13 +8,16 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { 
+import {
   createLLMClient,
   chatNode
 } from '@/lib/langgraph/nodes';
 import { AnalysisStateType, ChatMessage, FeedbackType } from '@/lib/langgraph/state';
-import { getKnowledgeManager } from '@/lib/knowledge';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import {
+  routeUnifiedFeedbackIntent,
+  runRecommendationFeedbackPipeline,
+} from '@/lib/recommendation/unified-feedback-bridge';
 
 /**
  * 聊天请求
@@ -33,6 +36,18 @@ interface ChatRequest {
     finalReport?: string;
   };
   chatHistory?: ChatMessage[];
+  /**
+   * 若当前会话同时处于「推荐」上下文，传入 item/user 以便与推荐闭环（记忆+PPO）对齐。
+   */
+  recommendationContext?: {
+    userId: string;
+    itemId: string;
+    strategy?: string;
+    position?: number;
+    explanationType?: string;
+  };
+  /** 显式点赞/踩，优先于从正文推断 */
+  recommendationPolarity?: 'like' | 'dislike';
 }
 
 /**
@@ -42,7 +57,14 @@ interface ChatRequest {
 export async function POST(request: NextRequest) {
   try {
     const body: ChatRequest = await request.json();
-    const { message, caseId, analysisContext, chatHistory = [] } = body;
+    const {
+      message,
+      caseId,
+      analysisContext,
+      chatHistory = [],
+      recommendationContext,
+      recommendationPolarity,
+    } = body;
     
     if (!message) {
       return NextResponse.json({
@@ -84,7 +106,56 @@ export async function POST(request: NextRequest) {
     
     // 生成建议问题
     const suggestions = generateSuggestions(feedbackType, feedbackTarget);
-    
+
+    const unifiedRouting = routeUnifiedFeedbackIntent(message, {
+      hasRecommendationContext: Boolean(recommendationContext?.userId && recommendationContext?.itemId),
+    });
+
+    let recommendationPipeline: {
+      ppoAccepted: boolean;
+      correctionCandidateId: string | null;
+    } | null = null;
+
+    if (
+      recommendationContext?.userId?.trim() &&
+      recommendationContext?.itemId?.trim() &&
+      unifiedRouting.channels.recommendation
+    ) {
+      const polarity =
+        recommendationPolarity ??
+        unifiedRouting.recommendationPolarity ??
+        (feedbackType === 'question' ? null : unifiedRouting.intent === 'approve'
+          ? 'like'
+          : unifiedRouting.intent === 'reject'
+            ? 'dislike'
+            : null);
+
+      let mappedFeedbackType: 'like' | 'dislike' | 'neutral' = 'neutral';
+      if (polarity === 'like' || polarity === 'dislike') {
+        mappedFeedbackType = polarity;
+      } else if (unifiedRouting.intent === 'approve') {
+        mappedFeedbackType = 'like';
+      } else if (unifiedRouting.intent === 'reject') {
+        mappedFeedbackType = 'dislike';
+      }
+
+      try {
+        recommendationPipeline = await runRecommendationFeedbackPipeline({
+          userId: recommendationContext.userId.trim(),
+          itemId: recommendationContext.itemId.trim(),
+          mappedFeedbackType,
+          intent: unifiedRouting.intent,
+          opinionText: message,
+          position: recommendationContext.position ?? 0,
+          strategy: recommendationContext.strategy ?? 'chat_feedback',
+          explanationType: recommendationContext.explanationType ?? 'chat_panel',
+          correction: null,
+        });
+      } catch (bridgeErr) {
+        console.warn('[ChatFeedback] unified recommendation bridge failed:', bridgeErr);
+      }
+    }
+
     // 存储有效反馈到数据库（仅当有 caseId 且反馈类型有效时）
     const validFeedbackTypes = ['correction', 'supplement', 'deep_dive'];
     let feedbackStored = false;
@@ -127,8 +198,14 @@ export async function POST(request: NextRequest) {
         feedbackTarget,
         chatMessage: lastMessage,
         suggestions,
-        feedbackStored: !!caseId && validFeedbackTypes.includes(feedbackType)
-      }
+        feedbackStored: !!caseId && validFeedbackTypes.includes(feedbackType),
+        unifiedFeedback: {
+          intent: unifiedRouting.intent,
+          channels: unifiedRouting.channels,
+          recommendationBridged: recommendationPipeline != null,
+          recommendationPipeline,
+        },
+      },
     });
     
   } catch (error) {

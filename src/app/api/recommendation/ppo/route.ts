@@ -1,38 +1,22 @@
 /**
  * PPO 策略优化 API
- * 
- * 提供 PPO 训练和推理接口
+ *
+ * 与 `PPOPolicyOptimizationService`（反馈闭环）共用同一 `PPOOptimizer` 实例，
+ * 见 `getSharedPPOOptimizer` / `getPPOPolicyService`。
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createPPOOptimizer, PPOOptimizer } from '@/lib/recommendation/ppo';
+import type { PPOOptimizer } from '@/lib/recommendation/ppo';
+import {
+  getPPOPolicyService,
+  getSharedPPOOptimizer,
+} from '@/lib/recommendation/ppo-integration';
 import {
   RecommendationState,
   PPOAction,
   TrainingSample,
   UserFeedbackSignal
 } from '@/lib/recommendation/ppo/types';
-
-// 全局 PPO 优化器实例（单例模式）
-let ppoOptimizer: PPOOptimizer | null = null;
-
-/**
- * 获取或创建 PPO 优化器实例
- */
-function getPPOOptimizer(): PPOOptimizer {
-  if (!ppoOptimizer) {
-    ppoOptimizer = createPPOOptimizer({
-      stateDim: 32,
-      hiddenDims: [128, 64, 32],
-      learningRate: 3e-4,
-      batchSize: 64,
-      epochs: 10,
-      bufferSize: 10000,
-      minSamples: 256
-    });
-  }
-  return ppoOptimizer;
-}
 
 /**
  * GET /api/recommendation/ppo
@@ -41,17 +25,29 @@ function getPPOOptimizer(): PPOOptimizer {
  */
 export async function GET(request: NextRequest) {
   try {
-    const optimizer = getPPOOptimizer();
+    const service = getPPOPolicyService();
+    const optimizer = getSharedPPOOptimizer();
     const state = optimizer.getState();
     const bufferSize = optimizer.getBufferSize();
-    
+    const minSamples = service.getPpoReplayMinSamples();
+    const policyState = service.getState();
+
     return NextResponse.json({
       success: true,
       data: {
         modelState: state,
         bufferSize,
-        isReady: bufferSize >= 256
-      }
+        minSamplesForReplayTrain: minSamples,
+        isReady: bufferSize >= minSamples,
+        policyOptimization: {
+          totalSessions: policyState.totalSessions,
+          totalFeedbacks: policyState.totalFeedbacks,
+          feedbackEventsSinceLastTrain: policyState.feedbackEventsSinceLastTrain,
+          lastTrainingTime: policyState.lastTrainingTime,
+          trainingCount: policyState.trainingCount,
+          lastTrainMode: policyState.lastTrainMode,
+        },
+      },
     });
   } catch (error) {
     console.error('[PPO API] GET error:', error);
@@ -76,8 +72,8 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { operation, data } = body;
-    
-    const optimizer = getPPOOptimizer();
+
+    const optimizer = getSharedPPOOptimizer();
     
     switch (operation) {
       case 'action':

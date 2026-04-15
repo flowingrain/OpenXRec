@@ -13,6 +13,12 @@ import type { LLMClient } from 'coze-coding-dev-sdk';
 import { embeddingService } from '@/lib/embedding/service';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createHash } from 'crypto';
+import type { ContextManager } from '@/lib/recommendation/context-manager';
+import {
+  getRecommendationContextManager,
+  ensureRecommendationChatSession,
+  buildAssistantTurnDigest,
+} from '@/lib/recommendation/recommendation-context-bridge';
 
 /**
  * 推荐 API：信息充足度评估 + AgentRecommendationService 多智能体推荐
@@ -93,6 +99,19 @@ async function persistRecommendationCase(params: {
   }
 }
 
+async function recordRecommendationAssistantTurn(
+  recCm: ContextManager | null,
+  sessionKey: string,
+  payload: Parameters<typeof buildAssistantTurnDigest>[0]
+): Promise<void> {
+  if (!recCm || !sessionKey) return;
+  try {
+    await recCm.addAssistantMessage(sessionKey, buildAssistantTurnDigest(payload));
+  } catch (e) {
+    console.warn('[Recommendation API] context assistant message skipped:', e);
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const requestStart = Date.now();
@@ -112,8 +131,10 @@ export async function POST(request: NextRequest) {
       sessionContext: bodySessionContext,
       skipSufficiencyCheck,
       userId,
+      sessionId: bodySessionId,
       forceRefresh,
-    } = body;
+      taskScheduleId: bodyTaskScheduleId,
+    } = body as Record<string, unknown>;
 
     const query = extractQueryFromBody(body);
 
@@ -133,15 +154,47 @@ export async function POST(request: NextRequest) {
       typeof sessionContext === 'object' && sessionContext && 'scenario' in sessionContext
         ? String((sessionContext as Record<string, unknown>).scenario)
         : undefined;
+
+    const taskScheduleIdFromContext =
+      typeof sessionContext === 'object' &&
+      sessionContext &&
+      'taskScheduleId' in sessionContext &&
+      typeof (sessionContext as Record<string, unknown>).taskScheduleId === 'string'
+        ? String((sessionContext as Record<string, unknown>).taskScheduleId).trim()
+        : undefined;
+    const taskScheduleId =
+      (typeof bodyTaskScheduleId === 'string' ? bodyTaskScheduleId.trim() : undefined) ||
+      taskScheduleIdFromContext;
     const cacheKey = buildCacheKey(query, scenario, typeof userId === 'string' ? userId : undefined);
+
+    const sessionKey =
+      typeof bodySessionId === 'string' && bodySessionId.trim()
+        ? bodySessionId.trim()
+        : typeof userId === 'string'
+          ? userId.trim()
+          : '';
+
+    let recCm: ContextManager | null = null;
+    let skipTtlForChatSession = false;
+    if (sessionKey) {
+      recCm = getRecommendationContextManager();
+      await ensureRecommendationChatSession(recCm, {
+        userId: sessionKey,
+        sessionId: sessionKey,
+        scenario,
+      });
+      const stats = recCm.getSessionStats(sessionKey);
+      skipTtlForChatSession = (stats?.messageCount ?? 0) > 0;
+    }
 
     console.log('[Recommendation API] Processing query:', query);
 
     // 热路径优化：TTL 命中时直接返回，避免后续 sufficiency / web_search / agent 耗时。
+    // 同一会话多轮对话时禁用 TTL，避免忽略已压缩的推荐对话历史。
     const ttlCacheStart = Date.now();
-    if (!forceRefresh) {
-      const cached = getCachedRecommendation(cacheKey);
+    if (!forceRefresh && !skipTtlForChatSession) {
       markStep('ttl_cache_lookup', ttlCacheStart);
+      const cached = getCachedRecommendation(cacheKey);
       if (cached) {
         stepTimings.total = Date.now() - requestStart;
         const cachedResponseData = {
@@ -166,6 +219,18 @@ export async function POST(request: NextRequest) {
           });
         } catch (e) {
           console.warn('[Recommendation API] ttl cache case persistence skipped:', e);
+        }
+        if (recCm && sessionKey) {
+          try {
+            await recCm.addUserMessage(sessionKey, query);
+            await recordRecommendationAssistantTurn(recCm, sessionKey, {
+              explanation:
+                typeof cachedResponseData.explanation === 'string' ? cachedResponseData.explanation : '',
+              itemCount: Array.isArray(cachedResponseData.items) ? cachedResponseData.items.length : 0,
+            });
+          } catch (e) {
+            console.warn('[Recommendation API] ttl cache chat turn skipped:', e);
+          }
         }
         console.log('[Recommendation API] Step timings (ms):', stepTimings);
         return NextResponse.json({
@@ -219,13 +284,31 @@ export async function POST(request: NextRequest) {
     }
     markStep('prepare_profile_context', profileMergeStart);
 
+    const baseCtx =
+      typeof sessionContext === 'object' && sessionContext
+        ? { ...(sessionContext as Record<string, unknown>) }
+        : {};
+    let effectiveSessionContext: Record<string, unknown> = baseCtx;
+
+    if (sessionKey && recCm) {
+      try {
+        await recCm.addUserMessage(sessionKey, query);
+        const historyText = await recCm.getContextForLLM(sessionKey);
+        if (historyText.trim()) {
+          effectiveSessionContext.recommendationChatHistory = historyText;
+        }
+      } catch (e) {
+        console.warn('[Recommendation API] recommendation chat context merge skipped:', e);
+      }
+    }
+
     if (!skipSufficiencyCheck) {
       console.log('[Recommendation API] Starting sufficiency evaluation...');
       const suffStart = Date.now();
       try {
         const llmClient = getLLMClient();
         const evaluator = createSufficiencyEvaluator(llmClient);
-        const sufficiency = await evaluator.evaluate(query, sessionContext);
+        const sufficiency = await evaluator.evaluate(query, effectiveSessionContext);
         markStep('sufficiency_evaluation', suffStart);
 
         if (
@@ -240,6 +323,10 @@ export async function POST(request: NextRequest) {
               question: q,
               type: 'text',
             }));
+          await recordRecommendationAssistantTurn(recCm, sessionKey, {
+            needsClarification: true,
+            explanation: '为了给您提供更精准的推荐，我需要了解一些额外信息。',
+          });
           return NextResponse.json({
             success: true,
             data: {
@@ -306,7 +393,7 @@ export async function POST(request: NextRequest) {
     }
 
     const vectorReuseStart = Date.now();
-    if (!forceRefresh) {
+    if (!forceRefresh && !skipTtlForChatSession) {
       try {
         const similar = await embeddingService.searchSimilarCases(query, { limit: 1, threshold: 0.92 });
         const best = similar[0];
@@ -344,6 +431,11 @@ export async function POST(request: NextRequest) {
             } catch (e) {
               console.warn('[Recommendation API] vector reuse case persistence skipped:', e);
             }
+            await recordRecommendationAssistantTurn(recCm, sessionKey, {
+              explanation:
+                typeof reusedResponseData.explanation === 'string' ? reusedResponseData.explanation : '',
+              itemCount: Array.isArray(reusedResponseData.items) ? reusedResponseData.items.length : 0,
+            });
             return NextResponse.json({
               success: true,
               data: reusedResponseData,
@@ -363,8 +455,8 @@ export async function POST(request: NextRequest) {
     const agentStart = Date.now();
     try {
       const sessionHints =
-        sessionContext && typeof sessionContext === 'object'
-          ? JSON.stringify(sessionContext).slice(0, 900)
+        effectiveSessionContext && Object.keys(effectiveSessionContext).length > 0
+          ? JSON.stringify(effectiveSessionContext).slice(0, 2400)
           : undefined;
 
       agentResult = await agentService.generateRecommendations(query, {
@@ -372,11 +464,17 @@ export async function POST(request: NextRequest) {
         webContext: webContext || undefined,
         userProfile: mergedUserProfile,
         sessionHints,
+        ...(taskScheduleId ? { taskScheduleId } : {}),
       });
       markStep('agent_generate_recommendations', agentStart);
     } catch (recErr: unknown) {
       markStep('agent_generate_recommendations', agentStart);
       console.error('[Recommendation API] Agent recommendation failed:', recErr);
+      await recordRecommendationAssistantTurn(recCm, sessionKey, {
+        itemCount: 0,
+        explanation:
+          '推荐服务暂时不可用。请配置 DEEPSEEK_API_KEY（或可用的 Coze LLM）与联网检索（WEB_SEARCH_PROVIDER / TAVILY_API_KEY 等）后重试。',
+      });
       return NextResponse.json({
         success: true,
         data: {
@@ -400,6 +498,12 @@ export async function POST(request: NextRequest) {
     }
 
     if (!agentResult.items?.length) {
+      const emptyExplanation =
+        agentResult.explanation || '未生成推荐项。请检查联网检索与 LLM 配置，或稍后重试。';
+      await recordRecommendationAssistantTurn(recCm, sessionKey, {
+        itemCount: 0,
+        explanation: emptyExplanation,
+      });
       return NextResponse.json({
         success: true,
         data: {
@@ -416,10 +520,10 @@ export async function POST(request: NextRequest) {
               ...agentResult.metadata,
             },
           },
-          explanation:
-            agentResult.explanation ||
-            '未生成推荐项。请检查联网检索与 LLM 配置，或稍后重试。',
-          metadata: agentResult.metadata,
+          explanation: emptyExplanation,
+          metadata: {
+            ...agentResult.metadata,
+          },
         },
       });
     }
@@ -470,6 +574,11 @@ export async function POST(request: NextRequest) {
         console.error('[Recommendation API] 推荐展示统计写入失败（不影响推荐结果）:', error);
       }
     }
+
+    await recordRecommendationAssistantTurn(recCm, sessionKey, {
+      itemCount: items.length,
+      explanation: agentResult.explanation || '',
+    });
 
     const responseData = {
       items,

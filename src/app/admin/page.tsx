@@ -51,6 +51,8 @@ import {
   ChevronRight,
   User,
   Settings,
+  Brain,
+  BookOpen,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -108,6 +110,48 @@ interface ReviewStats {
   recentRejected: number;
 }
 
+interface FeedbackEventLibraryItem {
+  id: string;
+  feedbackType: string;
+  comment: string | null;
+  caseId: string | null;
+  userId: string | null;
+  createdAt: string;
+}
+
+interface StrategyLearningLibraryItem {
+  versionId: string;
+  version: number;
+  source: string | null;
+  isActive: boolean;
+  isVerified: boolean;
+  createdAt: string;
+  avgReward: number | null;
+}
+
+interface KnowledgeCandidateLibraryItem {
+  id: string;
+  name: string;
+  patternType: string;
+  confidence: number | null;
+  isVerified: boolean;
+  createdAt: string;
+  source: string | null;
+}
+
+interface CapabilityLibraryState {
+  feedbackEvents: FeedbackEventLibraryItem[];
+  strategyLibrary: StrategyLearningLibraryItem[];
+  knowledgeCandidates: KnowledgeCandidateLibraryItem[];
+  stats: {
+    feedbackEvents: number;
+    strategyLearning: number;
+    strategyVersions: number;
+    strategyTrainingHistory: number;
+    knowledgeCandidates: number;
+  };
+}
+
 // ==================== 组件 ====================
 
 export default function AdminPage() {
@@ -123,6 +167,9 @@ export default function AdminPage() {
   const [queueLoading, setQueueLoading] = useState(false);
   const [filterType, setFilterType] = useState<'all' | 'entity' | 'relation'>('all');
   const [filterStatus, setFilterStatus] = useState<'pending' | 'approved' | 'rejected'>('pending');
+  const [capabilityLibraries, setCapabilityLibraries] = useState<CapabilityLibraryState | null>(null);
+  const [capabilityLoading, setCapabilityLoading] = useState(false);
+  const [capabilityWindowDays, setCapabilityWindowDays] = useState<'7' | '30' | 'all'>('30');
 
   // 审核对话框
   const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
@@ -198,6 +245,27 @@ export default function AdminPage() {
     }
   }, []);
 
+  // 加载能力积累库（仅管理员查看）
+  const loadCapabilityLibraries = useCallback(async () => {
+    setCapabilityLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', '20');
+      params.set('windowDays', capabilityWindowDays);
+      const res = await fetch(`/api/admin/capability-libraries?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setCapabilityLibraries(data.data as CapabilityLibraryState);
+        }
+      }
+    } catch (e) {
+      console.error('Load capability libraries failed:', e);
+    } finally {
+      setCapabilityLoading(false);
+    }
+  }, [capabilityWindowDays]);
+
   // 初始化
   useEffect(() => {
     checkAuth();
@@ -207,8 +275,9 @@ export default function AdminPage() {
     if (!authChecking && user && permissions?.canViewAdminPanel) {
       loadQueue();
       loadStats();
+      loadCapabilityLibraries();
     }
-  }, [authChecking, user, permissions, loadQueue, loadStats]);
+  }, [authChecking, user, permissions, loadQueue, loadStats, loadCapabilityLibraries]);
 
   // 审核操作
   const handleReview = async (approved: boolean) => {
@@ -424,6 +493,10 @@ export default function AdminPage() {
               <Settings className="w-4 h-4" />
               系统设置
             </TabsTrigger>
+            <TabsTrigger value="capability-libraries" className="gap-1.5">
+              <Database className="w-4 h-4" />
+              能力积累库
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="review" className="space-y-4">
@@ -576,6 +649,193 @@ export default function AdminPage() {
                 <p className="text-muted-foreground text-center py-8">
                   功能开发中...
                 </p>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="capability-libraries" className="space-y-4">
+            <Card>
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle>能力积累库（管理员）</CardTitle>
+                    <CardDescription>
+                      用户侧无感，仅用于查看系统沉淀：反馈事件、策略学习、知识候选
+                    </CardDescription>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={capabilityWindowDays}
+                      onValueChange={(v) => setCapabilityWindowDays(v as '7' | '30' | 'all')}
+                    >
+                      <SelectTrigger className="w-[140px]">
+                        <SelectValue placeholder="时间范围" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="7">近7天</SelectItem>
+                        <SelectItem value="30">近30天</SelectItem>
+                        <SelectItem value="all">全部</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button variant="outline" onClick={loadCapabilityLibraries} disabled={capabilityLoading}>
+                      {capabilityLoading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              </CardHeader>
+              <CardContent>
+                {capabilityLoading && !capabilityLibraries ? (
+                  <div className="py-8 text-center">
+                    <Loader2 className="w-6 h-6 animate-spin mx-auto text-muted-foreground" />
+                  </div>
+                ) : !capabilityLibraries ? (
+                  <p className="text-sm text-muted-foreground">暂无数据</p>
+                ) : (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <Card>
+                        <CardContent className="py-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">反馈事件库</p>
+                              <p className="text-2xl font-bold">{capabilityLibraries.stats.feedbackEvents}</p>
+                            </div>
+                            <MessageSquare className="w-6 h-6 text-blue-500" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                      <Card>
+                        <CardContent className="py-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">策略学习库</p>
+                              <p className="text-2xl font-bold">{capabilityLibraries.stats.strategyLearning}</p>
+                              <p className="text-xs text-muted-foreground">
+                                版本 {capabilityLibraries.stats.strategyVersions} / 训练 {capabilityLibraries.stats.strategyTrainingHistory}
+                              </p>
+                            </div>
+                            <Brain className="w-6 h-6 text-purple-500" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                      <Card>
+                        <CardContent className="py-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">知识候选库</p>
+                              <p className="text-2xl font-bold">{capabilityLibraries.stats.knowledgeCandidates}</p>
+                            </div>
+                            <BookOpen className="w-6 h-6 text-green-600" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </div>
+
+                    <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                      <Card>
+                        <CardHeader className="pb-2">
+                          <CardTitle className="text-base">反馈事件库</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                          <ScrollArea className="h-[320px] pr-2">
+                            <div className="space-y-2">
+                              {capabilityLibraries.feedbackEvents.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">暂无反馈事件</p>
+                              ) : (
+                                capabilityLibraries.feedbackEvents.map((item) => (
+                                  <div key={item.id} className="rounded-md border p-2">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <Badge variant="outline">{item.feedbackType}</Badge>
+                                      <span className="text-xs text-muted-foreground">
+                                        {new Date(item.createdAt).toLocaleString()}
+                                      </span>
+                                    </div>
+                                    <p className="text-xs mt-1 text-muted-foreground line-clamp-2">
+                                      {item.comment || '（无文本反馈）'}
+                                    </p>
+                                    <p className="text-[11px] mt-1 text-muted-foreground">
+                                      case={item.caseId || '-'} user={item.userId || '-'}
+                                    </p>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </ScrollArea>
+                        </CardContent>
+                      </Card>
+
+                      <Card>
+                        <CardHeader className="pb-2">
+                          <CardTitle className="text-base">策略学习库</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                          <ScrollArea className="h-[320px] pr-2">
+                            <div className="space-y-2">
+                              {capabilityLibraries.strategyLibrary.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">暂无策略版本记录</p>
+                              ) : (
+                                capabilityLibraries.strategyLibrary.map((item) => (
+                                  <div key={item.versionId} className="rounded-md border p-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Badge variant="outline">v{item.version}</Badge>
+                                      {item.isActive && <Badge className="bg-green-100 text-green-700">active</Badge>}
+                                      {item.isVerified && <Badge className="bg-blue-100 text-blue-700">verified</Badge>}
+                                      {item.source && <Badge variant="secondary">{item.source}</Badge>}
+                                    </div>
+                                    <p className="text-xs mt-1 text-muted-foreground">
+                                      avgReward: {typeof item.avgReward === 'number' ? item.avgReward.toFixed(3) : 'N/A'}
+                                    </p>
+                                    <p className="text-[11px] mt-1 text-muted-foreground">
+                                      {new Date(item.createdAt).toLocaleString()}
+                                    </p>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </ScrollArea>
+                        </CardContent>
+                      </Card>
+
+                      <Card>
+                        <CardHeader className="pb-2">
+                          <CardTitle className="text-base">知识候选库</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                          <ScrollArea className="h-[320px] pr-2">
+                            <div className="space-y-2">
+                              {capabilityLibraries.knowledgeCandidates.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">暂无候选知识</p>
+                              ) : (
+                                capabilityLibraries.knowledgeCandidates.map((item) => (
+                                  <div key={item.id} className="rounded-md border p-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Badge variant="outline">{item.patternType}</Badge>
+                                      <Badge className={item.isVerified ? 'bg-green-100 text-green-700' : 'bg-orange-100 text-orange-700'}>
+                                        {item.isVerified ? '已验证' : '待验证'}
+                                      </Badge>
+                                    </div>
+                                    <p className="text-xs mt-1 font-medium line-clamp-1">{item.name}</p>
+                                    <p className="text-[11px] mt-1 text-muted-foreground">
+                                      confidence={typeof item.confidence === 'number' ? item.confidence.toFixed(2) : 'N/A'}
+                                      {item.source ? ` · source=${item.source}` : ''}
+                                    </p>
+                                    <p className="text-[11px] mt-1 text-muted-foreground">
+                                      {new Date(item.createdAt).toLocaleString()}
+                                    </p>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </ScrollArea>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
           </TabsContent>

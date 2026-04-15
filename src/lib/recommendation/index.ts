@@ -51,6 +51,30 @@ export {
   type AgentServiceConfig,
 } from './agent-recommendation-service';
 
+export {
+  listTaskScheduleProfiles,
+  getTaskScheduleProfile,
+  resolveTaskSchedule,
+  applyConfigToFrozenPlan,
+  isTaskScheduleAutoMatchEnabled,
+  isTaskScheduleLegacyKeywordMatchEnabled,
+  normalizeAgentTaskScheduleId,
+  type TaskScheduleId,
+  type TaskScheduleProfile,
+  type FrozenExecutionPlan,
+  type TaskScheduleResolution,
+} from './task-schedule-registry';
+
+export {
+  classifyOpinionIntent,
+  routeUnifiedFeedbackIntent,
+  runRecommendationFeedbackPipeline,
+  type UnifiedFeedbackRouting,
+  type UnifiedFeedbackChannels,
+  type RecommendationFeedbackPipelineInput,
+  type RecommendationFeedbackPipelineResult,
+} from './unified-feedback-bridge';
+
 // ============================================================================
 // 评估模块
 // ============================================================================
