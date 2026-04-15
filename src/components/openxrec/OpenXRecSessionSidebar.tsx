@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { MessageSquare } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -31,6 +32,12 @@ export function OpenXRecSessionSidebar({
   onNewSession,
   onSwitchSession,
 }: OpenXRecSessionSidebarProps) {
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
+
   return (
     <Card className="flex flex-col min-h-0">
       <CardHeader className="pb-3">
@@ -74,7 +81,7 @@ export function OpenXRecSessionSidebar({
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {sessionMsgCount} 条消息 · {new Date(session.updatedAt).toLocaleTimeString()}
+                    {sessionMsgCount} 条消息 · {isMounted ? new Date(session.updatedAt).toLocaleTimeString() : '--:--:--'}
                   </p>
                 </button>
               );
