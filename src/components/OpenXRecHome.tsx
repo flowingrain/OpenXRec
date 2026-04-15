@@ -1,54 +1,44 @@
 'use client';
 
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import {
-  Sparkles,
-  Send,
   Bot,
-  User,
   Loader2,
-  Lightbulb,
   Brain,
   Network,
   Layers,
   GitBranch,
-  BookOpen,
-  Database,
   ArrowRight,
-  Upload,
-  FileText,
-  X,
-  ThumbsUp,
-  ThumbsDown,
-  Info,
   Settings,
-  ChevronRight,
   Activity,
   Zap,
   Target,
   TrendingUp,
   MessageSquare,
   Eye,
-  Code,
   Shield,
-  ExternalLink,
-  RefreshCw,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
-import { AuthButton, useAuth } from '@/components/auth/LoginDialog';
 import KnowledgeBasePanel from '@/components/knowledge/KnowledgeBasePanel';
 import CasesPanel from '@/components/cases/CasesPanel';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import type { KGEntity, KGRelation } from '@/lib/knowledge-graph/types';
+import { OpenXRecHeader } from '@/components/openxrec/OpenXRecHeader';
+import { OpenXRecSessionSidebar } from '@/components/openxrec/OpenXRecSessionSidebar';
+import { OpenXRecMessageList } from '@/components/openxrec/OpenXRecMessageList';
+import { OpenXRecRecommendationPanel } from '@/components/openxrec/OpenXRecRecommendationPanel';
+import { OpenXRecComposer } from '@/components/openxrec/OpenXRecComposer';
+import {
+  type Message,
+  type UploadedFile,
+  generateSessionId,
+  quickExamples,
+} from '@/components/openxrec/types';
 
 // 动态导入图谱组件
 const KnowledgeGraph = dynamic(() => import('@/components/knowledge/KnowledgeGraph'), {
@@ -60,119 +50,26 @@ const KnowledgeGraph = dynamic(() => import('@/components/knowledge/KnowledgeGra
   ),
 });
 
-const VECTOR_REUSE_RECOMPUTE_THRESHOLD = 0.94;
-
-// 类型定义
-interface RecommendationItem {
-  id: string;
-  title: string;
-  type: string;
-  description: string;
-  score: number;
-  confidence: number;
-  explanation: string;
-  factors: Array<{
-    name: string;
-    value: string;
-    importance: number;
-  }>;
-  // 新增：元数据（用于对比分析）
-  metadata?: {
-    isComparisonAnalysis?: boolean;
-    entities?: Array<{
-      name: string;
-      pros: string[];
-      cons: string[];
-    }>;
-    conclusion?: {
-      summary?: string;
-      recommendation?: string;
-    };
-    sources?: Array<{
-      title: string;
-      url?: string;
-      snippet?: string;
-    }>;
-  };
-  source?: string;
-  sourceUrl?: string;
-}
-
-interface Message {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: number;
-  recommendations?: RecommendationItem[];
-  explanation?: string;
-  // 新增：追问类型
-  clarification?: {
-    needsClarification: boolean;
-    questions: ClarificationQuestion[];
-    missingFields: string[];
-    progress: number;
-  };
-  // 新增：推荐类型
-  recommendationType?: 'comparison' | 'ranking' | 'single' | 'clarification' | 'comparison_analysis';
-  responseMeta?: {
-    cacheHit?: boolean;
-    cacheType?: string;
-    reusedCaseId?: string;
-    similarity?: number;
-    [key: string]: any;
-  };
-}
-
-// 新增：追问问题类型
-interface ClarificationQuestion {
-  id: string;
-  question: string;
-  type: 'single_choice' | 'multiple_choice' | 'text' | 'range';
-  options?: string[];
-  placeholder?: string;
-  required: boolean;
-  priority: 'high' | 'medium' | 'low';
-  fieldId?: string;
-}
-
-// 新增：排序型推荐结果
-interface RankingItem extends RecommendationItem {
-  rank?: number;
-  overallScore?: number;
-  scores?: {
-    name: string;
-    score: number;
-    weight: number;
-    description?: string;
-  }[];
-  advantages?: string[];
-  disadvantages?: string[];
-}
-
-interface UploadedFile {
-  id: string;
-  name: string;
-  size: number;
-  type: string;
-  content?: string;
-}
-
-// 会话ID生成
-const generateSessionId = () => `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-
-// 快速示例
-const quickExamples = [
-  '我想找一些关于推荐系统的学习资料',
-  '帮我推荐一些数据可视化工具',
-  '最近对机器学习很感兴趣，有什么好的入门资源？',
-  '我们公司需要选择一个合适的数据分析平台',
-];
-
 export default function OpenXRecHome() {
+  const initialSessionIdRef = useRef(generateSessionId());
+  const initialSessionId = initialSessionIdRef.current;
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [sessionId] = useState(generateSessionId());
+  const [sessionId, setSessionId] = useState(initialSessionId);
+  const [sessionList, setSessionList] = useState<
+    Array<{ id: string; title: string; createdAt: number; updatedAt: number }>
+  >([
+    {
+      id: initialSessionId,
+      title: '新会话',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+  ]);
+  const [sessionMessages, setSessionMessages] = useState<Record<string, Message[]>>({
+    [initialSessionId]: [],
+  });
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [activeTab, setActiveTab] = useState('chat');
   const [ppoStats, setPpoStats] = useState({
@@ -200,8 +97,8 @@ export default function OpenXRecHome() {
   const [feedbackPending, setFeedbackPending] = useState<Record<string, boolean>>({});
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestControllerRef = useRef<AbortController | null>(null);
 
   /** 最近一条含推荐结果的助手消息（主输入仍走 /api/recommendation） */
   const lastRecMessage = useMemo(
@@ -223,6 +120,28 @@ export default function OpenXRecHome() {
     const first = recs[0];
     return first ? first.id || '0' : undefined;
   }, [lastRecMessage, expandedRecId]);
+
+  const deriveSessionTitle = useCallback((sessionMsgs: Message[]) => {
+    const firstUser = sessionMsgs.find((m) => m.role === 'user' && m.content.trim());
+    if (!firstUser) return '新会话';
+    const plain = firstUser.content.trim().replace(/\s+/g, ' ');
+    return plain.length > 16 ? `${plain.slice(0, 16)}...` : plain;
+  }, []);
+
+  useEffect(() => {
+    setSessionMessages((prev) => ({ ...prev, [sessionId]: messages }));
+    setSessionList((prev) =>
+      prev.map((session) =>
+        session.id === sessionId
+          ? {
+              ...session,
+              title: deriveSessionTitle(messages),
+              updatedAt: Date.now(),
+            }
+          : session
+      )
+    );
+  }, [messages, sessionId, deriveSessionTitle]);
 
   // 滚动到底部
   const scrollToBottom = () => {
@@ -289,10 +208,6 @@ export default function OpenXRecHome() {
       reader.readAsText(file);
     }
     
-    // 清空input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
   };
 
   // 移除文件
@@ -301,6 +216,8 @@ export default function OpenXRecHome() {
   };
 
   const requestRecommendations = async (queryText: string, forceRefresh: boolean = false) => {
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
     try {
       // 构建请求
       const requestContext = {
@@ -316,6 +233,7 @@ export default function OpenXRecHome() {
       const response = await fetch('/api/recommendation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           userId: sessionId,
           sessionId,
@@ -418,6 +336,16 @@ export default function OpenXRecHome() {
       setUploadedFiles([]);
       
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        const stoppedMessage: Message = {
+          id: `msg_${Date.now()}_stopped`,
+          role: 'assistant',
+          content: '已停止当前推荐任务。您可以继续提问，或点击“新会话”开始新的推荐。',
+          timestamp: Date.now(),
+        };
+        setMessages(prev => [...prev, stoppedMessage]);
+        return;
+      }
       console.error('Failed to get recommendations:', error);
       const errorMessage: Message = {
         id: `msg_${Date.now() + 1}`,
@@ -427,6 +355,9 @@ export default function OpenXRecHome() {
       };
       setMessages(prev => [...prev, errorMessage]);
     } finally {
+      if (requestControllerRef.current === controller) {
+        requestControllerRef.current = null;
+      }
       setIsLoading(false);
     }
   };
@@ -455,6 +386,64 @@ export default function OpenXRecHome() {
     if (!queryText || isLoading) return;
     setIsLoading(true);
     await requestRecommendations(queryText, true);
+  };
+
+  const handleStopGeneration = () => {
+    if (!isLoading) return;
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = null;
+    setIsLoading(false);
+  };
+
+  const resetSessionScopedViewState = () => {
+    setInput('');
+    setUploadedFiles([]);
+    setClarificationContext(null);
+    setQuestionAnswers({});
+    setActiveClarificationId(null);
+    setKgEntities([]);
+    setKgRelations([]);
+    setExpandedRecId(null);
+    setFeedbackByItem({});
+    setFeedbackPending({});
+  };
+
+  const handleSwitchSession = (targetSessionId: string) => {
+    if (targetSessionId === sessionId) return;
+    if (isLoading) handleStopGeneration();
+    setSessionId(targetSessionId);
+    setMessages(sessionMessages[targetSessionId] || []);
+    resetSessionScopedViewState();
+  };
+
+  const handleNewSession = () => {
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = null;
+    setIsLoading(false);
+    const now = Date.now();
+    const newSessionId = generateSessionId();
+    setSessionMessages((prev) => ({
+      ...prev,
+      [sessionId]: messages,
+      [newSessionId]: [],
+    }));
+    setSessionList((prev) => [
+      {
+        id: newSessionId,
+        title: '新会话',
+        createdAt: now,
+        updatedAt: now,
+      },
+      ...prev.map((item) =>
+        item.id === sessionId
+          ? { ...item, title: deriveSessionTitle(messages), updatedAt: now }
+          : item
+      ),
+    ]);
+    setSessionId(newSessionId);
+    setMessages([]);
+    resetSessionScopedViewState();
+    setActiveTab('chat');
   };
 
   // 发送反馈（专用 /api/recommendation/feedback，勿用 /api/chat-feedback：后者是分析对话上下文用的）
@@ -630,52 +619,10 @@ export default function OpenXRecHome() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-blue-50 flex flex-col">
-      {/* 顶部导航 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-white/80 backdrop-blur-md">
-        <div className="container mx-auto px-4 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-blue-600 to-purple-600 text-white">
-                <Sparkles className="h-5 w-5" />
-              </div>
-              <div>
-                <h1 className="text-lg font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
-                  OpenXRec
-                </h1>
-                <p className="text-xs text-muted-foreground">可解释推荐系统</p>
-              </div>
-            </div>
-            <div className="flex items-center space-x-2">
-              <Button 
-                variant="ghost" 
-                size="sm" 
-                className="gap-1.5"
-                onClick={() => setIsKnowledgeBaseOpen(true)}
-              >
-                <BookOpen className="h-4 w-4" />
-                <span className="hidden md:inline">知识库</span>
-              </Button>
-              <Button 
-                variant="ghost" 
-                size="sm" 
-                className="gap-1.5"
-                onClick={() => setIsCasesOpen(true)}
-              >
-                <Database className="h-4 w-4" />
-                <span className="hidden md:inline">案例库</span>
-              </Button>
-              <Link href="/api-docs">
-                <Button variant="ghost" size="sm" className="gap-1.5">
-                  <Code className="h-4 w-4" />
-                  <span className="hidden md:inline">API</span>
-                </Button>
-              </Link>
-              <Separator orientation="vertical" className="h-6 mx-2" />
-              <AuthButton />
-            </div>
-          </div>
-        </div>
-      </header>
+      <OpenXRecHeader
+        onOpenKnowledgeBase={() => setIsKnowledgeBaseOpen(true)}
+        onOpenCases={() => setIsCasesOpen(true)}
+      />
 
       {/* 主内容区 */}
       <div className="flex-1 container mx-auto px-4 py-6 overflow-hidden">
@@ -724,8 +671,18 @@ export default function OpenXRecHome() {
 
           {/* 对话推荐 */}
           {activeTab === 'chat' && (
-            <div className="flex-1 flex flex-col min-h-0">
-              <Card className="flex-1 flex flex-col overflow-hidden">
+            <div className="flex-1 grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-4 min-h-0">
+              <OpenXRecSessionSidebar
+                sessionList={sessionList}
+                sessionId={sessionId}
+                sessionMessages={sessionMessages}
+                isLoading={isLoading}
+                onNewSession={handleNewSession}
+                onSwitchSession={handleSwitchSession}
+              />
+
+              <div className="min-h-0 flex flex-col">
+                <Card className="flex-1 flex flex-col overflow-hidden">
                 <CardHeader className="pb-3 flex-shrink-0">
                   <CardTitle className="text-base flex items-center gap-2">
                     <Bot className="w-5 h-5 text-blue-600" />
@@ -736,402 +693,28 @@ export default function OpenXRecHome() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="flex-1 flex flex-col gap-4 min-h-0 overflow-hidden">
-                  {/* 消息列表 */}
-                  <div className="flex-1 pr-4 overflow-y-auto">
-                    <div className="space-y-4 pb-4">
-                      {messages.length === 0 && (
-                          <div className="text-center py-8">
-                            <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center">
-                              <Lightbulb className="w-8 h-8 text-blue-600" />
-                            </div>
-                            <p className="text-muted-foreground mb-4">
-                              您好！我是 OpenXRec 推荐助手。请描述您的需求，我会为您提供可解释的推荐。
-                            </p>
-                            <div className="flex flex-wrap justify-center gap-2">
-                              {quickExamples.map((example, index) => (
-                                <Button
-                                  key={index}
-                                  variant="outline"
-                                  size="sm"
-                                  className="text-xs"
-                                  onClick={() => handleExampleClick(example)}
-                                >
-                                  {example}
-                                </Button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                        
-                      {messages.map((message) => (
-                          <div
-                            key={message.id}
-                            className={cn(
-                              'flex gap-3',
-                              message.role === 'user' ? 'justify-end' : 'justify-start'
-                            )}
-                          >
-                            {message.role === 'assistant' && (
-                              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white flex-shrink-0">
-                                <Bot className="w-4 h-4" />
-                              </div>
-                            )}
-                            <div
-                              className={cn(
-                                'max-w-[80%] rounded-lg px-4 py-2',
-                                message.role === 'user'
-                                  ? 'bg-blue-600 text-white'
-                                  : 'bg-muted'
-                              )}
-                            >
-                              <p className="text-sm whitespace-pre-wrap">{String(message.content || '')}</p>
-                              
-                              {/* 追问类型 */}
-                              {message.recommendationType === 'clarification' && message.clarification && (
-                                <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-                                  <div className="flex items-center gap-2 text-amber-700 font-medium mb-2">
-                                    <Lightbulb className="w-4 h-4" />
-                                    需要更多信息
-                                  </div>
-                                  <div className="mb-3">
-                                    <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-                                      <span>信息收集进度</span>
-                                      <span>{message.clarification.progress.toFixed(0)}%</span>
-                                    </div>
-                                    <div className="h-2 bg-amber-100 rounded-full overflow-hidden">
-                                      <div 
-                                        className="h-full bg-amber-500 rounded-full transition-all"
-                                        style={{ width: `${message.clarification.progress}%` }}
-                                      />
-                                    </div>
-                                  </div>
-                                  {message.clarification.questions && message.clarification.questions.length > 0 ? (
-                                    <div className="space-y-3">
-                                      {message.clarification.questions.map((q, i) => {
-                                        // 获取当前问题的选中答案
-                                        const selectedAnswer = questionAnswers[q.id];
-                                        return (
-                                          <div key={q.id || i} className="bg-white p-2 rounded border border-amber-100">
-                                            <div className="flex items-center gap-1 mb-2">
-                                              <span className="text-amber-600 font-medium">{i + 1}.</span>
-                                              <span className="font-medium">{String(q.question || '')}</span>
-                                              {q.required && (
-                                                <Badge variant="destructive" className="text-[10px] px-1 py-0 ml-1">
-                                                  必填
-                                                </Badge>
-                                              )}
-                                              {selectedAnswer && (
-                                                <Badge variant="default" className="text-[10px] px-1 py-0 ml-auto bg-green-500">
-                                                  已选
-                                                </Badge>
-                                              )}
-                                            </div>
-                                            {q.type === 'text' && (
-                                              <Input
-                                                placeholder={q.placeholder || '请输入...'}
-                                                className="h-8 text-sm"
-                                                onKeyDown={(e) => {
-                                                  if (e.key === 'Enter') {
-                                                    handleQuickAnswer(q.id, (e.target as HTMLInputElement).value);
-                                                  }
-                                                }}
-                                                onChange={(e) => {
-                                                  handleSelectAnswer(q.id, (e.target as HTMLInputElement).value);
-                                                }}
-                                              />
-                                            )}
-                                            {q.options && q.options.length > 0 && (
-                                              <div className="flex flex-wrap gap-1.5">
-                                                {q.options.map((opt, j) => {
-                                                  const isSelected = selectedAnswer === opt;
-                                                  return (
-                                                    <Button
-                                                      key={j}
-                                                      variant={isSelected ? "default" : "outline"}
-                                                      size="sm"
-                                                      className={cn(
-                                                        "h-7 text-xs transition-all",
-                                                        isSelected 
-                                                          ? "bg-amber-500 hover:bg-amber-600 border-amber-500" 
-                                                          : "hover:bg-amber-100 hover:border-amber-300"
-                                                      )}
-                                                      onClick={() => handleSelectAnswer(q.id, opt)}
-                                                    >
-                                                      {String(opt)}
-                                                    </Button>
-                                                  );
-                                                })}
-                                              </div>
-                                            )}
-                                          </div>
-                                        );
-                                      })}
-                                      {/* 提交按钮 */}
-                                      {Object.keys(questionAnswers).length > 0 && (
-                                        <Button
-                                          onClick={handleSubmitAnswers}
-                                          className="w-full bg-amber-500 hover:bg-amber-600"
-                                        >
-                                          提交答案 ({Object.keys(questionAnswers).length}项)
-                                        </Button>
-                                      )}
-                                    </div>
-                                  ) : (
-                                    <div className="text-sm text-muted-foreground">
-                                      请提供更多信息以便给您精准推荐
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                              
-                              {/* 消息气泡内不再重复渲染推荐列表，统一在下方“推荐结果”区域展示 */}
-                            </div>
-                            {message.role === 'user' && (
-                              <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center flex-shrink-0">
-                                <User className="w-4 h-4 text-slate-600" />
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                        
-                        {isLoading && (
-                          <div className="flex gap-3">
-                            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white">
-                              <Bot className="w-4 h-4" />
-                            </div>
-                            <div className="bg-muted rounded-lg px-4 py-2">
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            </div>
-                          </div>
-                        )}
-                        <div ref={messagesEndRef} />
-                      </div>
-                    </div>
+                  <OpenXRecMessageList
+                    messages={messages}
+                    isLoading={isLoading}
+                    quickExamples={quickExamples}
+                    questionAnswers={questionAnswers}
+                    onExampleClick={handleExampleClick}
+                    onSelectAnswer={handleSelectAnswer}
+                    onQuickAnswer={handleQuickAnswer}
+                    onSubmitAnswers={handleSubmitAnswers}
+                    messagesEndRef={messagesEndRef}
+                  />
 
-                    {/* 推荐结果列表（与 lastRecMessage useMemo 同源） */}
-                    {(() => {
-                      if (!lastRecMessage || !lastRecMessage.recommendations) return null;
-                      
-                      return (
-                        <div className="border rounded-lg bg-gradient-to-br from-slate-50 to-blue-50/50 p-4">
-                          <div className="flex items-center gap-2 text-sm font-semibold mb-4">
-                            <Sparkles className="w-4 h-4 text-blue-600" />
-                            推荐结果
-                            <Badge variant="secondary" className="text-xs ml-auto bg-blue-100 text-blue-700 hover:bg-blue-100">
-                              {lastRecMessage.recommendations.length} 项
-                            </Badge>
-                          </div>
-                          {lastRecMessage.responseMeta?.cacheHit && (
-                            <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 flex items-center justify-between gap-3">
-                              <div className="text-xs text-amber-800">
-                                命中{lastRecMessage.responseMeta.cacheType === 'vector_reuse' ? '向量复用' : '短时缓存'}
-                                {typeof lastRecMessage.responseMeta.similarity === 'number'
-                                  ? `（相似度 ${(lastRecMessage.responseMeta.similarity * 100).toFixed(0)}%）`
-                                  : ''}
-                                {lastRecMessage.responseMeta.cacheType === 'vector_reuse' &&
-                                  typeof lastRecMessage.responseMeta.similarity === 'number' &&
-                                  lastRecMessage.responseMeta.similarity < VECTOR_REUSE_RECOMPUTE_THRESHOLD
-                                  ? '，建议完整重算以获取最新结果'
-                                  : ''}
-                              </div>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-7 text-xs"
-                                onClick={rerunFullRecommendation}
-                                disabled={isLoading}
-                              >
-                                <RefreshCw className="w-3 h-3 mr-1" />
-                                完整重算
-                              </Button>
-                            </div>
-                          )}
-                          <div className="space-y-3">
-                            {lastRecMessage.recommendations.slice(0, 5).map((rec, index) => {
-                              const rankingRec = rec as RankingItem;
-                              const score = rankingRec?.overallScore ?? (rec.score ?? 0) * 100;
-                              const isExpanded = expandedRecId === rec.id;
-
-                              return (
-                                <Card key={rec.id || index} className="overflow-hidden shadow-sm hover:shadow-md transition-shadow">
-                                  {/* 可点击的头部 */}
-                                  <div
-                                    className={cn(
-                                      "cursor-pointer transition-colors",
-                                      isExpanded ? "bg-gradient-to-r from-blue-50 to-white" : "hover:bg-slate-50"
-                                    )}
-                                    onClick={() => setExpandedRecId(isExpanded ? null : (rec.id || String(index)))}
-                                  >
-                                    <div className="p-4">
-                                      <div className="flex items-start gap-3">
-                                        {/* 排序标识 */}
-                                        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white text-sm font-bold">
-                                          {index + 1}
-                                        </div>
-
-                                        {/* 标题和描述 */}
-                                        <div className="flex-1 min-w-0">
-                                          <div className="flex items-center gap-2 mb-1">
-                                            <h3 className="font-semibold text-slate-900 truncate">{String(rec.title || '')}</h3>
-                                            <Badge variant={score >= 90 ? "default" : "secondary"} className="text-xs bg-green-100 text-green-700 hover:bg-green-100">
-                                              {score.toFixed(0)}% 匹配
-                                            </Badge>
-                                          </div>
-                                          {rec.description && (
-                                            <p className="text-sm text-slate-600 line-clamp-2 leading-relaxed">
-                                              {String(rec.description || '')}
-                                            </p>
-                                          )}
-                                        </div>
-
-                                        {/* 展开指示器 */}
-                                        <ChevronRight className={cn(
-                                          "w-5 h-5 text-slate-400 flex-shrink-0 mt-1 transition-transform",
-                                              isExpanded && "rotate-90 text-blue-600"
-                                            )} />
-                                      </div>
-                                    </div>
-                                  </div>
-                                
-                                  {/* 展开的详细内容 */}
-                                  {isExpanded && (
-                                    <div className="border-t bg-gradient-to-b from-slate-50 to-white">
-                                      <CardContent className="pt-4 pb-4">
-                                        {/* 推荐理由（证据链分段展示） */}
-                                        {rec.explanation && (
-                                          <div className="mb-4 p-3 bg-blue-50/50 border border-blue-100 rounded-lg">
-                                            <div className="flex items-center gap-2 text-sm font-semibold text-blue-700 mb-2">
-                                              <Info className="w-4 h-4" />
-                                              推荐理由
-                                            </div>
-                                            {(() => {
-                                              const text = String(rec.explanation || '');
-                                              const [evidenceRaw, summaryRaw] = text.split('【推荐说明】');
-                                              const evidenceText = evidenceRaw.replace(/^【证据链】/, '').trim();
-                                              const summaryText = (summaryRaw || '').trim();
-                                              const evidenceParts = evidenceText
-                                                .split('|')
-                                                .map((s) => s.trim())
-                                                .filter(Boolean);
-                                              return (
-                                                <div className="space-y-2">
-                                                  {evidenceParts.length > 0 && (
-                                                    <div className="rounded-md border border-blue-100 bg-white/70 p-2">
-                                                      <div className="text-xs font-medium text-blue-700 mb-1">证据链</div>
-                                                      <div className="space-y-1">
-                                                        {evidenceParts.map((part, i) => (
-                                                          <p key={i} className="text-xs text-slate-600 leading-relaxed break-words">
-                                                            {part}
-                                                          </p>
-                                                        ))}
-                                                      </div>
-                                                    </div>
-                                                  )}
-                                                  <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
-                                                    {summaryText || text}
-                                                  </p>
-                                                </div>
-                                              );
-                                            })()}
-                                          </div>
-                                        )}
-
-                                        {/* 匹配因素 */}
-                                        {rec.factors && rec.factors.length > 0 && (
-                                          <div className="mb-4 p-3 bg-slate-50/50 border border-slate-100 rounded-lg">
-                                            <div className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-3">
-                                              <Activity className="w-4 h-4" />
-                                              匹配因素分析
-                                            </div>
-                                            <div className="space-y-3">
-                                              {rec.factors.map((factor, i) => (
-                                                <div key={i}>
-                                                  <div className="flex items-center justify-between text-xs mb-1.5">
-                                                    <span className="text-slate-600 font-medium">{factor.name}</span>
-                                                    <span className="text-slate-500 font-semibold">{(factor.importance * 100).toFixed(0)}%</span>
-                                                  </div>
-                                                  <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
-                                                    <div
-                                                      className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full transition-all"
-                                                      style={{ width: `${factor.importance * 100}%` }}
-                                                    />
-                                                  </div>
-                                                  <div className="mt-1 text-xs text-slate-500">{String(factor.value ?? '')}</div>
-                                                </div>
-                                              ))}
-                                            </div>
-                                          </div>
-                                        )}
-
-                                        {/* 操作按钮 */}
-                                        <div className="flex items-center justify-between pt-2 border-t">
-                                          {rec.sourceUrl && (
-                                            <a
-                                              href={rec.sourceUrl}
-                                              target="_blank"
-                                              rel="noopener noreferrer"
-                                              className="inline-flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-700 font-medium"
-                                              onClick={(e) => e.stopPropagation()}
-                                            >
-                                              <ExternalLink className="w-4 h-4" />
-                                              查看详情
-                                            </a>
-                                          )}
-                                          <div className="flex items-center gap-1 ml-auto">
-                                            {(() => {
-                                              const itemId = rec.id || String(index);
-                                              const liked = feedbackByItem[itemId] === 'like';
-                                              const disliked = feedbackByItem[itemId] === 'dislike';
-                                              const pending = !!feedbackPending[itemId];
-                                              return (
-                                                <>
-                                            <Button
-                                              variant={liked ? 'secondary' : 'ghost'}
-                                              size="sm"
-                                              className={cn(
-                                                'h-8 px-2 text-xs hover:bg-green-50 hover:text-green-700 gap-1',
-                                                liked && 'bg-green-100 text-green-700'
-                                              )}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                sendFeedback(itemId, 'like');
-                                              }}
-                                              disabled={pending}
-                                            >
-                                              <ThumbsUp className="w-3.5 h-3.5" />
-                                              有帮助
-                                            </Button>
-                                            <Button
-                                              variant={disliked ? 'secondary' : 'ghost'}
-                                              size="sm"
-                                              className={cn(
-                                                'h-8 px-2 text-xs hover:bg-red-50 hover:text-red-700 gap-1',
-                                                disliked && 'bg-red-100 text-red-700'
-                                              )}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                sendFeedback(itemId, 'dislike');
-                                              }}
-                                              disabled={pending}
-                                            >
-                                              <ThumbsDown className="w-3.5 h-3.5" />
-                                              不相关
-                                            </Button>
-                                                </>
-                                              );
-                                            })()}
-                                          </div>
-                                        </div>
-                                      </CardContent>
-                                    </div>
-                                  )}
-                                </Card>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      );
-                    })()}
+                    <OpenXRecRecommendationPanel
+                      lastRecMessage={lastRecMessage}
+                      isLoading={isLoading}
+                      expandedRecId={expandedRecId}
+                      feedbackByItem={feedbackByItem}
+                      feedbackPending={feedbackPending}
+                      onExpandedRecChange={setExpandedRecId}
+                      onRerunFullRecommendation={rerunFullRecommendation}
+                      onSendFeedback={sendFeedback}
+                    />
 
                     {/* 与研判页一致的 Chat 反馈入口：自然语言走 /api/chat-feedback，并带 recommendationContext 写入统一反馈桥 */}
                     {lastRecMessage && chatFeedbackItemId && (
@@ -1153,64 +736,21 @@ export default function OpenXRecHome() {
                       />
                     )}
 
-                    {/* 上传文件预览 */}
-                    {uploadedFiles.length > 0 && (
-                      <div className="flex flex-wrap gap-2 p-2 bg-muted/50 rounded-lg">
-                        {uploadedFiles.map((file) => (
-                          <div
-                            key={file.id}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-white border rounded-full text-sm"
-                          >
-                            <FileText className="w-3.5 h-3.5 text-blue-600" />
-                            <span className="max-w-[150px] truncate">{file.name}</span>
-                            <button
-                              onClick={() => removeFile(file.id)}
-                              className="text-slate-400 hover:text-slate-600"
-                            >
-                              <X className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* 输入区域 */}
-                    <div className="flex gap-2">
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        multiple
-                        accept=".txt,.md,.pdf,.doc,.docx"
-                        className="hidden"
-                        onChange={handleFileUpload}
-                      />
-                      <Button
-                        variant="outline"
-                        size="icon"
-                        onClick={() => fileInputRef.current?.click()}
-                        title="上传文档"
-                      >
-                        <Upload className="w-4 h-4" />
-                      </Button>
-                      <Input
-                        ref={inputRef}
-                        placeholder="描述您的需求..."
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-                        className="flex-1"
-                      />
-                      <Button onClick={sendMessage} disabled={isLoading} data-send-button>
-                        {isLoading ? (
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                        ) : (
-                          <Send className="w-4 h-4" />
-                        )}
-                      </Button>
-                    </div>
+                    <OpenXRecComposer
+                      uploadedFiles={uploadedFiles}
+                      input={input}
+                      isLoading={isLoading}
+                      inputRef={inputRef}
+                      onInputChange={setInput}
+                      onFileUpload={handleFileUpload}
+                      onRemoveFile={removeFile}
+                      onSend={sendMessage}
+                      onStop={handleStopGeneration}
+                    />
                   </CardContent>
                 </Card>
               </div>
+            </div>
           )}
 
           {/* 知识图谱 */}

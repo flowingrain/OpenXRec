@@ -5,7 +5,6 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
-import { Slot } from "@radix-ui/react-slot"
 
 function Dialog({
   ...props
@@ -14,16 +13,10 @@ function Dialog({
 }
 
 function DialogTrigger({
-  asChild = false,
-  children,
+  asChild,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Trigger> & {
-  asChild?: boolean
-}) {
-  const Comp = asChild ? Slot : DialogPrimitive.Trigger
-  // 检查 children 是否为函数，如果是则调用它
-  const renderChildren = typeof children === 'function' ? (children as Function)() : children;
-  return <Comp data-slot="dialog-trigger" {...props}>{renderChildren}</Comp>
+}: React.ComponentProps<typeof DialogPrimitive.Trigger>) {
+  return <DialogPrimitive.Trigger data-slot="dialog-trigger" asChild={asChild} {...props} />
 }
 
 function DialogPortal({
@@ -33,16 +26,10 @@ function DialogPortal({
 }
 
 function DialogClose({
-  asChild = false,
-  children,
+  asChild,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Close> & {
-  asChild?: boolean
-}) {
-  const Comp = asChild ? Slot : DialogPrimitive.Close
-  // 检查 children 是否为函数，如果是则调用它
-  const renderChildren = typeof children === 'function' ? (children as Function)() : children;
-  return <Comp data-slot="dialog-close" {...props}>{renderChildren}</Comp>
+}: React.ComponentProps<typeof DialogPrimitive.Close>) {
+  return <DialogPrimitive.Close data-slot="dialog-close" asChild={asChild} {...props} />
 }
 
 function DialogOverlay({
