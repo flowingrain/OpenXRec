@@ -20,6 +20,25 @@ import {
   VECTOR_REUSE_RECOMPUTE_THRESHOLD,
 } from '@/components/openxrec/types';
 
+type EvidenceCategory = 'match' | 'source' | 'comparison';
+
+function classifyEvidencePart(part: string): EvidenceCategory {
+  const text = part.toLowerCase();
+  if (/(对比|综合评分|排名|优先|领先|高于|低于|优于|劣于|候选|top)/.test(text)) {
+    return 'comparison';
+  }
+  if (/(来源|知识库|文档|搜索|web|kg|图谱|证据=关联|预置)/.test(text)) {
+    return 'source';
+  }
+  return 'match';
+}
+
+function evidenceCategoryLabel(category: EvidenceCategory): string {
+  if (category === 'source') return '来源证据';
+  if (category === 'comparison') return '对比证据';
+  return '匹配证据';
+}
+
 type OpenXRecRecommendationPanelProps = {
   lastRecMessage?: Message;
   isLoading: boolean;
@@ -141,17 +160,41 @@ export function OpenXRecRecommendationPanel({
                             .split('|')
                             .map((s) => s.trim())
                             .filter(Boolean);
+                          const groupedEvidence = evidenceParts.reduce<Record<EvidenceCategory, string[]>>(
+                            (acc, part) => {
+                              const category = classifyEvidencePart(part);
+                              acc[category].push(part);
+                              return acc;
+                            },
+                            { match: [], source: [], comparison: [] }
+                          );
                           return (
                             <div className="space-y-2">
                               {evidenceParts.length > 0 && (
                                 <div className="rounded-md border border-blue-100 bg-white/70 p-2">
-                                  <div className="text-xs font-medium text-blue-700 mb-1">证据链</div>
-                                  <div className="space-y-1">
-                                    {evidenceParts.map((part, i) => (
-                                      <p key={i} className="text-xs text-slate-600 leading-relaxed break-words">
-                                        {part}
-                                      </p>
-                                    ))}
+                                  <div className="text-xs font-medium text-blue-700 mb-1">证据链（分组）</div>
+                                  <div className="space-y-2">
+                                    {(['match', 'source', 'comparison'] as EvidenceCategory[]).map((category) => {
+                                      const parts = groupedEvidence[category];
+                                      if (parts.length === 0) return null;
+                                      return (
+                                        <div key={category}>
+                                          <div className="text-[11px] font-medium text-blue-700/90 mb-1">
+                                            {evidenceCategoryLabel(category)}
+                                          </div>
+                                          <div className="space-y-1">
+                                            {parts.map((part, i) => (
+                                              <p
+                                                key={`${category}-${i}`}
+                                                className="text-xs text-slate-600 leading-relaxed break-words"
+                                              >
+                                                {part}
+                                              </p>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
                                   </div>
                                 </div>
                               )}

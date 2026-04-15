@@ -33,6 +33,7 @@ import { OpenXRecSessionSidebar } from '@/components/openxrec/OpenXRecSessionSid
 import { OpenXRecMessageList } from '@/components/openxrec/OpenXRecMessageList';
 import { OpenXRecRecommendationPanel } from '@/components/openxrec/OpenXRecRecommendationPanel';
 import { OpenXRecComposer } from '@/components/openxrec/OpenXRecComposer';
+import { OpenXRecEventTraceTab } from '@/components/openxrec/OpenXRecEventTraceTab';
 import {
   type Message,
   type UploadedFile,
@@ -95,6 +96,15 @@ export default function OpenXRecHome() {
   // 推荐反馈状态（用于按钮高亮与防重复点击）
   const [feedbackByItem, setFeedbackByItem] = useState<Record<string, 'like' | 'dislike'>>({});
   const [feedbackPending, setFeedbackPending] = useState<Record<string, boolean>>({});
+  const [liveTrace, setLiveTrace] = useState<{
+    currentPhase: string | null;
+    phases: string[];
+    phaseTimings: Record<string, number>;
+  }>({
+    currentPhase: null,
+    phases: [],
+    phaseTimings: {},
+  });
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -218,6 +228,7 @@ export default function OpenXRecHome() {
   const requestRecommendations = async (queryText: string, forceRefresh: boolean = false) => {
     const controller = new AbortController();
     requestControllerRef.current = controller;
+    setLiveTrace({ currentPhase: null, phases: [], phaseTimings: {} });
     try {
       // 构建请求
       const requestContext = {
@@ -229,29 +240,125 @@ export default function OpenXRecHome() {
         sessionId,
       };
 
-      // 调用推荐API
-      const response = await fetch('/api/recommendation', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          userId: sessionId,
-          sessionId,
-          scenario: 'general',
-          context: {
-            query: queryText,
-            ...requestContext,
-          },
-          forceRefresh,
-          options: {
-            topK: 5,
-            withExplanation: true,
-            enableDiversity: true,
-          },
-        }),
-      });
+      const requestPayload = {
+        userId: sessionId,
+        sessionId,
+        scenario: 'general',
+        context: {
+          query: queryText,
+          ...requestContext,
+        },
+        forceRefresh,
+        options: {
+          topK: 5,
+          withExplanation: true,
+          enableDiversity: true,
+        },
+      };
 
-      const data = await response.json();
+      let data: any = null;
+      try {
+        // 默认走流式：实时展示智能体执行链路
+        const response = await fetch('/api/recommendation/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            ...requestPayload,
+            stream: true,
+          }),
+        });
+
+        if (!response.ok || !response.body) {
+          throw new Error(`stream_request_failed_${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        const handleSseBlock = (block: string) => {
+          const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+          if (lines.length === 0) return;
+          const eventLine = lines.find((line) => line.startsWith('event:'));
+          const dataLine = lines.find((line) => line.startsWith('data:'));
+          if (!dataLine) return;
+          const eventName = eventLine ? eventLine.replace('event:', '').trim() : 'message';
+          const payloadRaw = dataLine.replace('data:', '').trim();
+          if (!payloadRaw) return;
+
+          let payload: any;
+          try {
+            payload = JSON.parse(payloadRaw);
+          } catch {
+            return;
+          }
+
+          if (eventName === 'progress') {
+            const phase = typeof payload.phase === 'string' ? payload.phase : '';
+            const status = typeof payload.status === 'string' ? payload.status : '';
+            setLiveTrace((prev) => {
+              const nextPhases = phase && !prev.phases.includes(phase) ? [...prev.phases, phase] : prev.phases;
+              return {
+                currentPhase: status === 'start' ? phase : prev.currentPhase === phase ? null : prev.currentPhase,
+                phases: nextPhases,
+                phaseTimings:
+                  payload.phaseTimings && typeof payload.phaseTimings === 'object'
+                    ? { ...prev.phaseTimings, ...payload.phaseTimings }
+                    : prev.phaseTimings,
+              };
+            });
+            return;
+          }
+
+          if (eventName === 'final') {
+            data = payload;
+            return;
+          }
+
+          if (eventName === 'error') {
+            throw new Error(payload?.message || 'stream_error');
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split('\n\n');
+          buffer = chunks.pop() || '';
+          for (const chunk of chunks) {
+            handleSseBlock(chunk);
+          }
+        }
+        if (buffer.trim()) {
+          handleSseBlock(buffer);
+        }
+        if (!data) {
+          throw new Error('stream_missing_final_payload');
+        }
+      } catch (streamError) {
+        if (streamError instanceof DOMException && streamError.name === 'AbortError') {
+          throw streamError;
+        }
+        console.warn('[OpenXRecHome] SSE unavailable, fallback to JSON:', streamError);
+        setLiveTrace((prev) => ({ ...prev, currentPhase: null }));
+
+        // 仅在流式不可用时兜底到非流式
+        const fallbackResponse = await fetch('/api/recommendation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            ...requestPayload,
+            stream: false,
+          }),
+        });
+        if (!fallbackResponse.ok) {
+          throw new Error(`fallback_request_failed_${fallbackResponse.status}`);
+        }
+        data = await fallbackResponse.json();
+      }
       
       // 检查是否是追问类型
       if (data.success && data.data.metadata?.clarification?.needsClarification) {
@@ -358,6 +465,7 @@ export default function OpenXRecHome() {
       if (requestControllerRef.current === controller) {
         requestControllerRef.current = null;
       }
+      setLiveTrace((prev) => ({ ...prev, currentPhase: null }));
       setIsLoading(false);
     }
   };
@@ -392,6 +500,7 @@ export default function OpenXRecHome() {
     if (!isLoading) return;
     requestControllerRef.current?.abort();
     requestControllerRef.current = null;
+    setLiveTrace({ currentPhase: null, phases: [], phaseTimings: {} });
     setIsLoading(false);
   };
 
@@ -406,6 +515,7 @@ export default function OpenXRecHome() {
     setExpandedRecId(null);
     setFeedbackByItem({});
     setFeedbackPending({});
+    setLiveTrace({ currentPhase: null, phases: [], phaseTimings: {} });
   };
 
   const handleSwitchSession = (targetSessionId: string) => {
@@ -627,7 +737,7 @@ export default function OpenXRecHome() {
       {/* 主内容区 */}
       <div className="flex-1 container mx-auto px-4 py-6 overflow-hidden">
         <div className="h-full flex flex-col min-h-0">
-          <div className="grid w-full grid-cols-3 max-w-md mx-auto mb-4">
+          <div className="grid w-full grid-cols-4 max-w-2xl mx-auto mb-4">
             <button
               onClick={() => setActiveTab('chat')}
               className={`px-4 py-2 text-sm font-medium rounded-l-md border ${
@@ -652,6 +762,19 @@ export default function OpenXRecHome() {
               <div className="flex items-center gap-1.5 justify-center">
                 <Network className="w-4 h-4" />
                 知识图谱
+              </div>
+            </button>
+            <button
+              onClick={() => setActiveTab('event')}
+              className={`px-4 py-2 text-sm font-medium border-y border-r border-l-0 ${
+                activeTab === 'event'
+                  ? 'bg-background text-foreground border-input'
+                  : 'bg-muted/50 text-muted-foreground border-transparent'
+              }`}
+            >
+              <div className="flex items-center gap-1.5 justify-center">
+                <GitBranch className="w-4 h-4" />
+                事件图谱
               </div>
             </button>
             <button
@@ -751,6 +874,17 @@ export default function OpenXRecHome() {
                 </Card>
               </div>
             </div>
+          )}
+
+          {activeTab === 'event' && (
+            <OpenXRecEventTraceTab
+              topic={lastUserMessage?.content || '推荐任务'}
+              isLoading={isLoading}
+              lastRecMessage={lastRecMessage}
+              kgEntities={kgEntities}
+              kgRelations={kgRelations}
+              liveTrace={liveTrace}
+            />
           )}
 
           {/* 知识图谱 */}

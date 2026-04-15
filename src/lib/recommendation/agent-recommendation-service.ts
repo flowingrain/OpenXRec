@@ -106,6 +106,14 @@ export interface AgentServiceConfig {
   defaultTaskScheduleId?: string;
 }
 
+export interface AgentProgressEvent {
+  phase: string;
+  status: 'start' | 'complete';
+  timestamp: number;
+  agentsUsed?: string[];
+  phaseTimings?: Record<string, number>;
+}
+
 type TaskComplexity = 'simple' | 'moderate' | 'complex';
 
 interface RecommendationExecutionPlan {
@@ -172,6 +180,9 @@ export class AgentRecommendationService {
        * 显式传入时优先于自动关键词/场景匹配。
        */
       taskScheduleId?: string;
+    },
+    hooks?: {
+      onProgress?: (event: AgentProgressEvent) => void;
     }
   ): Promise<AgentRecommendationResult> {
     const startTime = Date.now();
@@ -179,6 +190,13 @@ export class AgentRecommendationService {
     const phaseTimings: Record<string, number> = {};
     const markPhase = (name: string, phaseStart: number) => {
       phaseTimings[name] = Date.now() - phaseStart;
+      hooks?.onProgress?.({
+        phase: name,
+        status: 'complete',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+        phaseTimings: { ...phaseTimings },
+      });
     };
 
     console.log('[AgentRecommendationService] Starting agent-based recommendation...');
@@ -190,6 +208,12 @@ export class AgentRecommendationService {
       // ========================================
       console.log('[AgentRecommendationService] Phase 1: Intent Analysis Agent');
       const phase1Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'intent_analysis',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const intentResult = await this.runIntentAnalyzer(query, context.scenario);
       markPhase('intent_analysis', phase1Start);
       agentsUsed.push('intent_analyzer');
@@ -246,6 +270,12 @@ export class AgentRecommendationService {
       // ========================================
       console.log('[AgentRecommendationService] Phase 2: Candidate Generation');
       const phase2Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'candidate_generation',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const candidates = await this.generateCandidates(query, context);
       markPhase('candidate_generation', phase2Start);
       agentsUsed.push('candidate_generator');
@@ -257,6 +287,12 @@ export class AgentRecommendationService {
       // ========================================
       console.log('[AgentRecommendationService] Phase 3: Feature Extraction Agent');
       const phase3Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'feature_extraction',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const itemsWithFeatures = await this.runFeatureExtractor(candidates, query, context);
       markPhase('feature_extraction', phase3Start);
       agentsUsed.push('feature_extractor');
@@ -271,12 +307,24 @@ export class AgentRecommendationService {
         ? this.runKGReasoner(query, itemsWithFeatures)
         : Promise.resolve(new Map<string, KGEvidence[]>());
       const phase31Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'similarity_and_kg',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const [similarities, kgRelations] = await Promise.all([
         similarityTask,
         kgTask,
       ]);
       markPhase('similarity_and_kg', phase31Start);
       const phase32Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'causal_reasoning',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const causalChain = executionPlan.useCausalReasoning
         ? await this.runCausalReasoner(query, itemsWithFeatures, kgRelations)
         : new Map<string, string>();
@@ -290,6 +338,12 @@ export class AgentRecommendationService {
       // ========================================
       console.log('[AgentRecommendationService] Phase 4: Enhanced Ranking Agent');
       const phase4Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'ranking',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const rankedItems = await this.runRankingAgent(
         itemsWithFeatures,
         query,
@@ -307,6 +361,12 @@ export class AgentRecommendationService {
       // ========================================
       console.log('[AgentRecommendationService] Phase 5: Explanation Generation Agent');
       const phase5Start = Date.now();
+      hooks?.onProgress?.({
+        phase: 'explanation_generation',
+        status: 'start',
+        timestamp: Date.now(),
+        agentsUsed: [...agentsUsed],
+      });
       const itemsWithExplanations = await this.runExplanationGenerator(
         rankedItems,
         query,
@@ -330,6 +390,12 @@ export class AgentRecommendationService {
       if (executionPlan.useDiversityOptimizer) {
         console.log('[AgentRecommendationService] Phase 6: Diversity Optimization Agent');
         const phase6Start = Date.now();
+        hooks?.onProgress?.({
+          phase: 'diversity_optimization',
+          status: 'start',
+          timestamp: Date.now(),
+          agentsUsed: [...agentsUsed],
+        });
         optimizedItems = await this.runDiversityOptimizer(itemsWithExplanations);
         markPhase('diversity_optimization', phase6Start);
         agentsUsed.push('diversity_optimizer');
